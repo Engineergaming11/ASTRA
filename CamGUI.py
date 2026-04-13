@@ -101,10 +101,309 @@ class ZWOCameraGUI:
         self._livewcs_poll_running = True
         self._poll_livewcs()
 
+        # Show viewing mode selection popup on startup
+        self.viewing_mode = None
+        self.root.after(100, self._show_viewing_mode_popup)
+
         # Auto-select first camera if available
         if self.available_cameras:
             self.camera_select_var.set(f"{self.available_cameras[0][0]}: {self.available_cameras[0][1]}")
             self.connect_camera()
+
+    def _show_viewing_mode_popup(self):
+        """Show a startup dialog asking the user what type of viewing they are doing."""
+        popup = ctk.CTkToplevel(self.root)
+        popup.title("Viewing Mode")
+        popup.geometry("360x200")
+        popup.resizable(False, False)
+        popup.grab_set()  # Make it modal
+
+        # Center over the main window
+        self.root.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width() // 2) - 180
+        y = self.root.winfo_y() + (self.root.winfo_height() // 2) - 100
+        popup.geometry(f"+{x}+{y}")
+
+        ctk.CTkLabel(
+            popup,
+            text="What type of viewing are you doing?",
+            font=("Segoe UI", 14, "bold"),
+            wraplength=320,
+        ).pack(pady=(28, 20))
+
+        btn_frame = ctk.CTkFrame(popup, fg_color="transparent")
+        btn_frame.pack(pady=(0, 20))
+
+        def select_mode(mode):
+            self.viewing_mode = mode
+            print(f"Viewing mode selected: {mode}")
+            popup.destroy()
+            if mode == "day":
+                self.root.after(50, self._show_solar_filter_popup)
+            elif mode == "night":
+                self.root.after(50, lambda: self._show_polar_motors_popup(viewing_mode="night"))
+            elif mode == "deep_sky":
+                self.root.after(50, self._show_polar_motors_on_popup)
+
+        for label, mode in [("☀  Day Time", "day"), ("🌙  Night Time", "night"), ("🔭  Deep Sky", "deep_sky")]:
+            ctk.CTkButton(
+                btn_frame,
+                text=label,
+                command=lambda m=mode: select_mode(m),
+                font=("Segoe UI", 11, "bold"),
+                width=90,
+                height=38,
+                fg_color="#0b5c8f",
+                hover_color="#1a7ab5",
+                corner_radius=8,
+            ).pack(side=tk.LEFT, padx=6)
+
+    def _show_solar_filter_popup(self, first_time=True):
+        """Warn the user to attach a solar filter before daytime solar viewing."""
+        popup = ctk.CTkToplevel(self.root)
+        popup.title("Safety Check")
+        popup.resizable(False, False)
+        popup.grab_set()
+
+        # Center over the main window
+        self.root.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width() // 2) - 185
+        y = self.root.winfo_y() + (self.root.winfo_height() // 2) - 110
+        popup.geometry(f"370x220+{x}+{y}")
+
+        # Warning icon + message
+        ctk.CTkLabel(
+            popup,
+            text="⚠️",
+            font=("Segoe UI", 36),
+        ).pack(pady=(22, 4))
+
+        ctk.CTkLabel(
+            popup,
+            text="Do you have a solar filter on?",
+            font=("Segoe UI", 14, "bold"),
+        ).pack()
+
+        if not first_time:
+            ctk.CTkLabel(
+                popup,
+                text="A solar filter is required for daytime viewing.\nDo NOT point at the sun without one!",
+                font=("Segoe UI", 10),
+                text_color="#ff4444",
+                wraplength=320,
+                justify="center",
+            ).pack(pady=(6, 0))
+
+        btn_frame = ctk.CTkFrame(popup, fg_color="transparent")
+        btn_frame.pack(pady=(16, 20))
+
+        def on_yes():
+            popup.destroy()
+            self.root.after(50, lambda: self._show_polar_motors_popup(viewing_mode="day"))
+
+        def on_no():
+            popup.destroy()
+            self.root.after(50, lambda: self._show_solar_filter_popup(first_time=False))
+
+        ctk.CTkButton(
+            btn_frame,
+            text="Yes",
+            command=on_yes,
+            font=("Segoe UI", 12, "bold"),
+            width=100,
+            height=38,
+            fg_color="#2e7d32",
+            hover_color="#43a047",
+            corner_radius=8,
+        ).pack(side=tk.LEFT, padx=10)
+
+        ctk.CTkButton(
+            btn_frame,
+            text="No",
+            command=on_no,
+            font=("Segoe UI", 12, "bold"),
+            width=100,
+            height=38,
+            fg_color="#c62828",
+            hover_color="#e53935",
+            corner_radius=8,
+        ).pack(side=tk.LEFT, padx=10)
+
+    def _apply_mode_settings(self, night_mode, image_format):
+        """Apply theme and image format based on the selected viewing mode."""
+        # Apply theme if needed
+        if night_mode and not self.night_mode:
+            self.night_mode = True
+            self.theme = THEMES["night"]
+            self.theme_btn.configure(text="🌙 Night Mode")
+            self.apply_theme()
+        elif not night_mode and self.night_mode:
+            self.night_mode = False
+            self.theme = THEMES["day"]
+            self.theme_btn.configure(text="☀ Day Mode")
+            self.apply_theme()
+
+        # Apply image format
+        self.format_var.set(image_format)
+        self.update_image_format()
+
+    def _show_polar_motors_popup(self, first_time=True, viewing_mode="day"):
+        """Check that polar alignment motors are off before daytime solar viewing."""
+        popup = ctk.CTkToplevel(self.root)
+        popup.title("Equipment Check")
+        popup.resizable(False, False)
+        popup.grab_set()
+
+        # Center over the main window
+        self.root.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width() // 2) - 185
+        y = self.root.winfo_y() + (self.root.winfo_height() // 2) - 110
+        popup.geometry(f"370x220+{x}+{y}")
+
+        ctk.CTkLabel(
+            popup,
+            text="⚙️",
+            font=("Segoe UI", 36),
+        ).pack(pady=(22, 4))
+
+        ctk.CTkLabel(
+            popup,
+            text="Are the polar alignment motors turned off?",
+            font=("Segoe UI", 14, "bold"),
+            wraplength=320,
+            justify="center",
+        ).pack()
+
+        if not first_time:
+            ctk.CTkLabel(
+                popup,
+                text="Please turn off the polar alignment motors\nbefore proceeding.",
+                font=("Segoe UI", 10),
+                text_color="#ff4444",
+                wraplength=320,
+                justify="center",
+            ).pack(pady=(6, 0))
+
+        btn_frame = ctk.CTkFrame(popup, fg_color="transparent")
+        btn_frame.pack(pady=(16, 20))
+
+        def on_yes():
+            popup.destroy()
+            if viewing_mode == "day":
+                self._apply_mode_settings(night_mode=False, image_format="RAW8")
+            elif viewing_mode == "night":
+                self._apply_mode_settings(night_mode=True, image_format="RAW8")
+
+        def on_no():
+            popup.destroy()
+            self.root.after(50, lambda: self._show_polar_motors_popup(first_time=False, viewing_mode=viewing_mode))
+
+        ctk.CTkButton(
+            btn_frame,
+            text="Yes",
+            command=on_yes,
+            font=("Segoe UI", 12, "bold"),
+            width=100,
+            height=38,
+            fg_color="#2e7d32",
+            hover_color="#43a047",
+            corner_radius=8,
+        ).pack(side=tk.LEFT, padx=10)
+
+        ctk.CTkButton(
+            btn_frame,
+            text="No",
+            command=on_no,
+            font=("Segoe UI", 12, "bold"),
+            width=100,
+            height=38,
+            fg_color="#c62828",
+            hover_color="#e53935",
+            corner_radius=8,
+        ).pack(side=tk.LEFT, padx=10)
+
+    def _show_polar_motors_on_popup(self, first_time=True):
+        """Check that polar alignment motors are ON for deep sky viewing."""
+        popup = ctk.CTkToplevel(self.root)
+        popup.title("Equipment Check")
+        popup.resizable(False, False)
+        popup.grab_set()
+
+        # Center over the main window
+        self.root.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width() // 2) - 185
+        y = self.root.winfo_y() + (self.root.winfo_height() // 2) - 110
+        popup.geometry(f"370x220+{x}+{y}")
+
+        ctk.CTkLabel(
+            popup,
+            text="⚙️",
+            font=("Segoe UI", 36),
+        ).pack(pady=(22, 4))
+
+        ctk.CTkLabel(
+            popup,
+            text="Are the polar alignment motors turned on?",
+            font=("Segoe UI", 14, "bold"),
+            wraplength=320,
+            justify="center",
+        ).pack()
+
+        if not first_time:
+            ctk.CTkLabel(
+                popup,
+                text="Please turn on the polar alignment motors\nbefore proceeding.",
+                font=("Segoe UI", 10),
+                text_color="#ff4444",
+                wraplength=320,
+                justify="center",
+            ).pack(pady=(6, 0))
+
+        btn_frame = ctk.CTkFrame(popup, fg_color="transparent")
+        btn_frame.pack(pady=(16, 20))
+
+        def on_yes():
+            popup.destroy()
+            self._apply_mode_settings(night_mode=True, image_format="RAW16")
+
+        def on_no():
+            popup.destroy()
+            self.root.after(50, lambda: self._show_polar_motors_on_popup(first_time=False))
+
+        ctk.CTkButton(
+            btn_frame,
+            text="Yes",
+            command=on_yes,
+            font=("Segoe UI", 12, "bold"),
+            width=100,
+            height=38,
+            fg_color="#2e7d32",
+            hover_color="#43a047",
+            corner_radius=8,
+        ).pack(side=tk.LEFT, padx=10)
+
+        ctk.CTkButton(
+            btn_frame,
+            text="No",
+            command=on_no,
+            font=("Segoe UI", 12, "bold"),
+            width=100,
+            height=38,
+            fg_color="#c62828",
+            hover_color="#e53935",
+            corner_radius=8,
+        ).pack(side=tk.LEFT, padx=10)
+
+    def _get_exposure_seconds(self):
+        """Return current exposure as seconds (float), used for timeout and FPS calculations."""
+        range_text = self.exposure_range_var.get()
+        exp_val = self.exposure_var.get()
+        if range_text == "32-1000us":
+            return exp_val / 1_000_000
+        elif range_text in ("1-10s", "10-60s"):
+            return exp_val
+        else:
+            return exp_val / 1000.0
 
     def setup_ui(self):
         style = ttk.Style()
@@ -391,6 +690,51 @@ class ZWOCameraGUI:
         )
         self.browse_btn.pack(side=tk.LEFT, padx=(4, 0))
 
+        # PROJECT NAME
+        tk.Label(
+            self.left, text="Project Name:", font=("Segoe UI", 9)
+        ).pack(anchor="w", pady=(8, 0))
+
+        self.project_name_entry = ctk.CTkEntry(
+            self.left,
+            font=("Segoe UI", 8),
+            height=28,
+            fg_color="white",
+            text_color="#1a1a1a",
+            placeholder_text_color="#1a1a1a",
+            border_color="#cccccc",
+            border_width=1,
+            corner_radius=6,
+            placeholder_text="e.g. Jupiter_2026"
+        )
+        self.project_name_entry.pack(fill=tk.X, pady=4)
+
+        # FRAME TYPE
+        tk.Label(
+            self.left, text="Frame Type:", font=("Segoe UI", 9)
+        ).pack(anchor="w", pady=(8, 0))
+
+        self.frame_type_var = tk.StringVar(value="Light")
+        self.frame_type_dropdown = ctk.CTkComboBox(
+            self.left,
+            variable=self.frame_type_var,
+            values=["Light", "Dark", "Flat", "Bias"],
+            font=("Segoe UI", 9),
+            height=28,
+            fg_color="white",
+            text_color="#1a1a1a",
+            border_color="#cccccc",
+            border_width=1,
+            corner_radius=6,
+            button_color="#0b5c8f",
+            button_hover_color="#1a7ab5",
+            state="readonly",
+            dropdown_fg_color="white",
+            dropdown_hover_color="#f0f0f0",
+            dropdown_text_color="#1a1a1a",
+        )
+        self.frame_type_dropdown.pack(fill=tk.X, pady=4)
+
         # CAPTURE BUTTONS
         ttk.Separator(self.left).pack(fill=tk.X, pady=10)
 
@@ -598,6 +942,14 @@ class ZWOCameraGUI:
             border_color=t["border"]
         )
 
+        # Project name entry
+        self.project_name_entry.configure(
+            fg_color=t["bg_secondary"] if self.night_mode else "white",
+            text_color=t["fg_primary"],
+            placeholder_text_color=t["fg_primary"],
+            border_color=t["border"]
+        )
+
         # Plate Solver and Sky Tracker top bar buttons — same style as action buttons
         for btn in [self.plate_solve_btn, self.skytrack_top_btn]:
             btn.configure(fg_color=t["accent"], hover_color=t["accent_light"], text_color=btn_text_color)
@@ -627,7 +979,7 @@ class ZWOCameraGUI:
         }
 
         for combo in [self.camera_dropdown, self.binning_dropdown, self.format_dropdown,
-                      self.capture_count_dropdown, self.exposure_range_dropdown]:
+                      self.capture_count_dropdown, self.exposure_range_dropdown, self.frame_type_dropdown]:
             combo.configure(**combo_settings)
 
         slider_settings = {
@@ -776,18 +1128,9 @@ class ZWOCameraGUI:
             traceback.print_exc()
 
     def update_exposure_range(self, choice=None):
-        """Update exposure slider range based on selected range.
-
-        Internal slider unit:
-          - "32-1000us" range  → slider value is in MICROSECONDS (µs)
-          - all other ranges   → slider value is in MILLISECONDS (ms)
-        """
+        """Update exposure slider range based on selected range."""
         range_text = self.exposure_range_var.get()
 
-        # Map: range_label -> (slider_min, slider_max, internal_unit)
-        # "us"  = microseconds  (slider value passed straight to set_control_value as µs)
-        # "ms"  = milliseconds
-        # "s"   = seconds
         range_map = {
             "32-1000us":     (32,   1000,  "us"),
             "1-100ms":       (1,    100,   "ms"),
@@ -809,31 +1152,20 @@ class ZWOCameraGUI:
             self.exposure_slider.set(min_val)
             self.update_exposure(min_val)
 
-
-
     def update_exposure(self, value):
-        """Update camera exposure.
-
-        The slider value's unit depends on the selected exposure range:
-          - "32-1000us" → value is µs  → display as µs, send as-is (ASI API uses µs)
-          - ms ranges   → value is ms  → display as ms/s, multiply ×1000 for ASI API
-          - s  ranges   → value is ms  → display as s,    multiply ×1000 for ASI API
-        """
+        """Update camera exposure."""
         val = float(value)
         range_text = self.exposure_range_var.get()
 
         if range_text == "32-1000us":
-            # Value is in microseconds
             self.exposure_label.configure(text=f"{val:.0f} µs")
             exposure_us = int(val)
         elif range_text in ("1-10s", "10-60s"):
-            # Value is in seconds
             self.exposure_label.configure(text=f"{val:.1f} s")
-            exposure_us = int(val * 1_000_000)  # convert s → µs for ASI API
+            exposure_us = int(val * 1_000_000)
         else:
-            # Value is in milliseconds
             self.exposure_label.configure(text=f"{val:.1f} ms")
-            exposure_us = int(val * 1000)       # convert ms → µs for ASI API
+            exposure_us = int(val * 1000)
 
         if not self.camera or not self.camera_initialized:
             return
@@ -933,7 +1265,15 @@ class ZWOCameraGUI:
     def preview_loop(self):
         while self.is_capturing:
             try:
-                frame = self.camera.capture_video_frame()
+                # FIX: Compute a timeout that accounts for the actual exposure duration.
+                # The ZWO API default timeout is too short for exposures longer than ~1s,
+                # causing capture_video_frame() to raise an error before the frame arrives.
+                # Formula: exposure_ms * 2 + 500ms gives a safe margin in all ranges.
+                exposure_s = self._get_exposure_seconds()
+                exposure_ms = exposure_s * 1000
+                timeout_ms = int(exposure_ms * 2 + 500)
+
+                frame = self.camera.capture_video_frame(timeout=timeout_ms)
 
                 if frame is not None:
                     current_format = self.format_var.get()
@@ -986,7 +1326,13 @@ class ZWOCameraGUI:
 
         session_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         capture_folder = f"capture_{session_timestamp}"
-        capture_path = os.path.join(self.save_path, capture_folder)
+        project_name = self.project_name_entry.get().strip()
+        frame_type = self.frame_type_var.get()
+        if project_name:
+            base_path = os.path.join(self.save_path, project_name, frame_type)
+        else:
+            base_path = os.path.join(self.save_path, frame_type)
+        capture_path = os.path.join(base_path, capture_folder)
 
         try:
             os.makedirs(capture_path, exist_ok=True)
@@ -1239,18 +1585,34 @@ class ZWOCameraGUI:
 
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             filename = f"video_{timestamp}.avi"
-            filepath = os.path.join(self.save_path, filename)
+            project_name = self.project_name_entry.get().strip()
+            frame_type = self.frame_type_var.get()
+            if project_name:
+                video_dir = os.path.join(self.save_path, project_name, frame_type)
+            else:
+                video_dir = os.path.join(self.save_path, frame_type)
+            os.makedirs(video_dir, exist_ok=True)
+            filepath = os.path.join(video_dir, filename)
 
             info = self.camera.get_roi_format()
             width = info[0]
             height = info[1]
 
+            # FIX: Derive FPS from actual exposure time instead of hardcoding 30.
+            # A hardcoded 30 FPS causes the AVI to play back wildly accelerated for
+            # long exposures (e.g. 5s exposure at 30 FPS = 150x real speed), and the
+            # write buffer backs up or drops frames. We cap at 30 FPS for short
+            # exposures and floor at 1 FPS so the VideoWriter always stays valid.
+            exposure_s = self._get_exposure_seconds()
+            fps = min(30.0, 1.0 / exposure_s) if exposure_s > 0 else 30.0
+            fps = max(fps, 1.0)
+
             fourcc = cv2.VideoWriter_fourcc(*'XVID')
-            self.video_writer = cv2.VideoWriter(filepath, fourcc, 30.0, (width, height))
+            self.video_writer = cv2.VideoWriter(filepath, fourcc, fps, (width, height))
 
             self.is_recording = True
             self.record_video_btn.configure(text="Stop Recording")
-            self.update_status(f"Recording to: {filename}")
+            self.update_status(f"Recording to: {filename} @ {fps:.1f} FPS")
 
         except Exception as e:
             messagebox.showerror("Error", f"Failed to start recording: {e}")
@@ -1281,7 +1643,7 @@ class ZWOCameraGUI:
 
     def open_skytrack(self):
         try:
-            skytrack_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "SkyTracker2.py") #replace with alt az gui 2
+            skytrack_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "SkyTracker2.py")
             self._skytrack_process = subprocess.Popen(["python3", skytrack_path])
             self.update_status("SkyTrack opened")
             self._update_skytrack_status()
