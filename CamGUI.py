@@ -81,7 +81,7 @@ class ZWOCameraGUI:
 
         # Initialize ZWO library
         try:
-            asi.init("libASICamera2.dylib")
+            asi.init("libASICamera2.dylib") #change for Pi 5 "libASICamera2.so"
             num_cameras = asi.get_num_cameras()
             if num_cameras > 0:
                 for i in range(num_cameras):
