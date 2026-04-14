@@ -472,6 +472,21 @@ class ZWOCameraGUI:
         )
         self.skytrack_top_btn.pack(side=tk.RIGHT, padx=(0, 8))
 
+        self.mount_controls_btn = ctk.CTkButton(
+            self.top_bar,
+            text="Mount Controls",
+            command=self.open_mount_controls,
+            font=("Segoe UI", 9, "bold"),
+            width=130,
+            height=32,
+            fg_color="#0b5c8f",
+            text_color="white",
+            hover_color="#1a7ab5",
+            corner_radius=6,
+            border_width=0
+        )
+        self.mount_controls_btn.pack(side=tk.RIGHT, padx=(0, 8))
+
         # MAIN CONTAINER
         self.main = tk.Frame(self.root)
         self.main.pack(fill=tk.BOTH, expand=True, padx=12, pady=8)
@@ -950,9 +965,9 @@ class ZWOCameraGUI:
             border_color=t["border"]
         )
 
-        # Plate Solver and Sky Tracker top bar buttons — same style as action buttons
-        for btn in [self.plate_solve_btn, self.skytrack_top_btn]:
-            btn.configure(fg_color=t["accent"], hover_color=t["accent_light"], text_color=btn_text_color)
+        # Plate Solver, Sky Tracker, and Mount Controls top bar buttons — same style as action buttons
+        for btn in [self.plate_solve_btn, self.skytrack_top_btn, self.mount_controls_btn]:
+            btn.configure(fg_color=t["accent"], hover_color=t["accent_light"], text_color=btn_text_color, border_width=0, border_color=t["accent"])
 
         process = getattr(self, "_skytrack_process", None)
         is_tracking = process is not None and process.poll() is None
@@ -1649,6 +1664,14 @@ class ZWOCameraGUI:
             self._update_skytrack_status()
         except Exception as e:
             messagebox.showerror("Error", f"Failed to open SkyTrackTest.py:\n{e}")
+
+    def open_mount_controls(self):
+        try:
+            mount_controls_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "EQMountControls.py")
+            subprocess.Popen(["python3", mount_controls_path])
+            self.update_status("Mount Controls opened")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to open EQMountControls.py:\n{e}")
 
     def _update_skytrack_status(self):
         process = getattr(self, "_skytrack_process", None)
