@@ -260,19 +260,31 @@ class IOptronHAE:
     def get_firmware(self) -> str:
         return self.send_command(":FW1#")
 
-    def set_utc_time(self) -> tuple:
+    def set_utc_time(self) -> bool:
         """
-        Set mount UTC time from the system clock via :SUT<XXXXXXXXXXXXX>#.
-        Value = (JD(current UTC) - J2000) * 8.64e7, resolution 1 ms.
-        Returns (ok: bool, utc_str: str).
+        Set mount UTC time via :SUT<XXXXXXXXXXXXX>#
+        Format: 13-digit unsigned ms since J2000, matching iOptron driver.
         """
-        j2000     = datetime.datetime(2000, 1, 1, 12, 0, 0, tzinfo=datetime.timezone.utc)
+        J2000     = 2451545.0
         now       = datetime.datetime.now(datetime.timezone.utc)
-        offset_ms = round((now - j2000).total_seconds() * 1000)
-        cmd       = f":SUT{offset_ms:+015d}#"
+        # Julian Day of now
+        epoch     = datetime.datetime(2000, 1, 1, 12, 0, 0, tzinfo=datetime.timezone.utc)
+        JD        = J2000 + (now - epoch).total_seconds() / 86400.0
+        ms_jd     = int((JD - J2000) * 8.64e7)
+        cmd       = f":SUT{ms_jd:013d}#"
         resp      = self.send_command(cmd)
-        utc_str   = now.strftime("%Y-%m-%d %H:%M:%S UTC")
-        return resp[:1] == "1", utc_str
+        return resp[:1] == "1"
+
+    def set_utc_offset(self) -> bool:
+        """
+        Set mount UTC offset via :SG<s><MMM>#
+        Format: sign + 3-digit minutes (e.g. MST = -420 → :SG-420#)
+        """
+        offset_min = int(-time.altzone / 60) if time.daylight else int(-time.timezone / 60)
+        sign       = "+" if offset_min >= 0 else "-"
+        cmd        = f":SG{sign}{abs(offset_min):03d}#"
+        resp       = self.send_command(cmd)
+        return resp[:1] == "1"
 
     # ── Location  :SLO#  :SLA# ────────────────────────────────────────────────
 
@@ -436,28 +448,10 @@ class IOptronHAEWifi(IOptronHAE):
 
     def connect(self) -> str:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(5)
+        s.settimeout(TIMEOUT)
         s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        try:
-            import subprocess
-            result = subprocess.run(
-                ["ipconfig", "getifaddr", "en0"],
-                capture_output=True, text=True, timeout=2,
-            )
-            en0_ip = result.stdout.strip()
-            if en0_ip:
-                s.bind((en0_ip, 0))
-        except Exception:
-            pass
         s.connect((self._ip, self._port))
         self._sock = s
-        time.sleep(0.5)
-        s.settimeout(1.0)
-        try:
-            s.recv(64)
-        except socket.timeout:
-            pass
-        s.settimeout(0.5)
         info = self.send_command(":MountInfo#")
         if not info:
             raise ConnectionError("No response from mount over WiFi.")
@@ -475,24 +469,10 @@ class IOptronHAEWifi(IOptronHAE):
     def connected(self) -> bool:
         return self._sock is not None
 
-    def _drain(self):
-        """Discard any bytes already sitting in the socket receive buffer.
-        Call this before sending every command so unsolicited position updates
-        (sent by the mount during slews) cannot contaminate the next response."""
-        self._sock.settimeout(0.0)
-        try:
-            while self._sock.recv(512):
-                pass
-        except (socket.timeout, BlockingIOError):
-            pass
-        finally:
-            self._sock.settimeout(0.5)
-
     def send_command(self, cmd: str) -> str:
         if not self.connected:
             raise RuntimeError("Not connected.")
         with self._lock:
-            self._drain()                          # flush stale/unsolicited data
             self._sock.sendall(cmd.encode("ascii"))
             buf = b""
             deadline = time.time() + TIMEOUT
@@ -500,41 +480,20 @@ class IOptronHAEWifi(IOptronHAE):
                 try:
                     chunk = self._sock.recv(256)
                 except socket.timeout:
-                    # Don't break — keep retrying until the deadline.
-                    # A single 0.5s timeout doesn't mean the mount isn't
-                    # going to respond; it may just be settling post-slew.
                     continue
                 if not chunk:
-                    # Empty read = connection closed
                     break
                 buf += chunk
                 if b"#" in buf:
-                    # Drain briefly to absorb any compound suffix the firmware
-                    # appended immediately after the terminator (e.g. "1#+...#").
-                    self._sock.settimeout(0.15)
-                    try:
-                        while True:
-                            extra = self._sock.recv(256)
-                            if not extra:
-                                break
-                            buf += extra
-                    except socket.timeout:
-                        pass
-                    finally:
-                        self._sock.settimeout(0.5)
                     break
             raw = buf.decode("ascii", errors="replace")
-            # Return only the first #-terminated token.
-            first_token = raw.split("#")[0]
-            return first_token.strip()
+            return raw.split("#")[0].strip()
 
     def send_no_reply(self, cmd: str):
         if not self.connected:
             raise RuntimeError("Not connected.")
         with self._lock:
-            self._drain()
             self._sock.sendall(cmd.encode("ascii"))
-            time.sleep(0.05)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -724,40 +683,6 @@ class MountControlApp(ctk.CTk):
             text_color=PAL["text"], placeholder_text="e.g. +22:00:52",
         )
         self._ps_dec_entry.pack(side="right")
-
-        # Pier side toggle
-        pier_row = ctk.CTkFrame(ps_panel, fg_color="transparent")
-        pier_row.pack(fill="x", pady=(0, 12))
-        ctk.CTkLabel(pier_row, text="Pier Side",
-                     text_color=PAL["muted"],
-                     font=ctk.CTkFont(size=13), width=90, anchor="w",
-                     ).pack(side="left")
-        ctk.CTkLabel(pier_row, text="(which side of mount is the scope on?)",
-                     text_color=PAL["muted"],
-                     font=ctk.CTkFont(size=11), anchor="w",
-                     ).pack(side="left", padx=(4, 0))
-
-        self._ps_pier_var = tk.StringVar(value="1")   # default West (most common for Polaris)
-        pier_btn_frame = ctk.CTkFrame(pier_row, fg_color="transparent")
-        pier_btn_frame.pack(side="right")
-
-        self._pier_east_btn = ctk.CTkButton(
-            pier_btn_frame, text="◐  EAST", width=90, height=32, corner_radius=6,
-            fg_color=PAL["entry_bg"], hover_color=PAL["accent2"],
-            text_color=PAL["text"],
-            font=ctk.CTkFont(family="Courier New", size=11, weight="bold"),
-            command=lambda: self._set_pier_side("0"),
-        )
-        self._pier_east_btn.pack(side="left", padx=(0, 4))
-
-        self._pier_west_btn = ctk.CTkButton(
-            pier_btn_frame, text="◑  WEST", width=90, height=32, corner_radius=6,
-            fg_color=PAL["accent2"], hover_color="#2563eb",
-            text_color=PAL["text"],
-            font=ctk.CTkFont(family="Courier New", size=11, weight="bold"),
-            command=lambda: self._set_pier_side("1"),
-        )
-        self._pier_west_btn.pack(side="left")
 
         # CM calibrate button
         self._ps_calibrate_btn = ctk.CTkButton(
@@ -1182,15 +1107,26 @@ class MountControlApp(ctk.CTk):
     def _connect_serial(self):
         port = self._port_var.get()
         self.log(f"Connecting to {port}…")
-        self.mount = IOptronHAE(port)
-        try:
-            info = self.mount.connect()
-            fw   = self.mount.get_firmware()
-            self._on_connected(f"Serial {port}", info, fw)
-        except Exception as exc:
-            self.mount = None
-            self.log(f"Connection failed: {exc}", PAL["danger"])
-            messagebox.showerror("Connection Error", str(exc))
+        self._connect_btn.configure(state="disabled", text="CONNECTING…")
+
+        def _worker():
+            try:
+                mount = IOptronHAE(port)
+                info  = mount.connect()
+                fw    = mount.get_firmware()
+                self.mount = mount
+                self.after(0, lambda i=info, f=fw: self._on_connected(f"Serial {port}", i, f))
+            except Exception as exc:
+                err = str(exc)
+                self.after(0, lambda e=err: self._on_serial_fail(e))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_serial_fail(self, err: str):
+        self.mount = None
+        self._connect_btn.configure(state="normal", text="CONNECT")
+        self.log(f"Connection failed: {err}", PAL["danger"])
+        messagebox.showerror("Connection Error", err)
 
     def _connect_wifi(self):
         ip = self._wifi_ip_var.get().strip() or WIFI_DEFAULT_IP
@@ -1223,15 +1159,21 @@ class MountControlApp(ctk.CTk):
         )
         self._set_mount_controls(True)
         self.log(f"Connected ({label}) — model:{info}  FW:{fw}", PAL["success"])
-        # Sync mount UTC time from system clock on every connect
+        # Sync UTC time and offset to mount on every connect
         try:
-            ok, utc_str = self.mount.set_utc_time()
-            if ok:
-                self.log(f"UTC time synced to mount  ({utc_str}).", PAL["success"])
+            if self.mount.set_utc_time():
+                self.log("UTC time synced to mount.", PAL["success"])
             else:
-                self.log(f"UTC time sync failed (mount rejected :SUT#).", PAL["danger"])
+                self.log("UTC time sync failed (mount rejected :SUT#).", PAL["danger"])
         except Exception as exc:
             self.log(f"UTC time sync error: {exc}", PAL["danger"])
+        try:
+            if self.mount.set_utc_offset():
+                self.log("UTC offset synced to mount.", PAL["success"])
+            else:
+                self.log("UTC offset sync failed (mount rejected :SG#).", PAL["danger"])
+        except Exception as exc:
+            self.log(f"UTC offset sync error: {exc}", PAL["danger"])
         self.log("Tip: start polling to see live RA/Dec position.", PAL["muted"])
 
     def _on_wifi_fail(self, err: str):
@@ -1297,38 +1239,49 @@ class MountControlApp(ctk.CTk):
         ra_hms = _deg_to_hms(ra_deg)
         dec_dms = _deg_to_dms(dec_deg)
         self.log(f"[Sync]  RA={ra_hms}  Dec={dec_dms}", PAL["muted"])
-        try:
-            ok = self.mount.sync_radec(ra_deg, dec_deg)
-            msg = "Sync accepted." if ok else "Sync failed."
-            self.after(0, lambda: self.log(f"  → {msg}", PAL["success"] if ok else PAL["danger"]))
-        except Exception as exc:
-            self.log(f"Sync error: {exc}", PAL["danger"])
+
+        def _worker():
+            try:
+                ok = self.mount.sync_radec(ra_deg, dec_deg)
+                msg = "Sync accepted." if ok else "Sync failed."
+                col = PAL["success"] if ok else PAL["danger"]
+                self.after(0, lambda m=msg, c=col: self.log(f"  → {m}", c))
+            except Exception as exc:
+                self.after(0, lambda e=exc: self.log(f"Sync error: {e}", PAL["danger"]))
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     # ── Stop / Home / Unpark ───────────────────────────────────────────────────
 
     def _stop(self):
         if not self._check_connected(): return
-        try:
-            self.mount.stop_slew()
-            self.log("STOP — slew halted.", PAL["danger"])
-        except Exception as exc:
-            self.log(f"Error: {exc}", PAL["danger"])
+        def _worker():
+            try:
+                self.mount.stop_slew()
+                self.after(0, lambda: self.log("STOP — slew halted.", PAL["danger"]))
+            except Exception as exc:
+                self.after(0, lambda e=exc: self.log(f"Error: {e}", PAL["danger"]))
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _go_home(self):
         if not self._check_connected(): return
-        try:
-            self.mount.go_home()
-            self.log("Slewing to zero/home position (:MH#)…", PAL["muted"])
-        except Exception as exc:
-            self.log(f"Error: {exc}", PAL["danger"])
+        def _worker():
+            try:
+                self.mount.go_home()
+                self.after(0, lambda: self.log("Slewing to zero/home position (:MH#)…", PAL["muted"]))
+            except Exception as exc:
+                self.after(0, lambda e=exc: self.log(f"Error: {e}", PAL["danger"]))
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _unpark(self):
         if not self._check_connected(): return
-        try:
-            self.mount.unpark()
-            self.log("Unparked (:MP0#).", PAL["success"])
-        except Exception as exc:
-            self.log(f"Error: {exc}", PAL["danger"])
+        def _worker():
+            try:
+                self.mount.unpark()
+                self.after(0, lambda: self.log("Unparked (:MP0#).", PAL["success"]))
+            except Exception as exc:
+                self.after(0, lambda e=exc: self.log(f"Error: {e}", PAL["danger"]))
+        threading.Thread(target=_worker, daemon=True).start()
 
     # ── Slew rate ──────────────────────────────────────────────────────────────
 
@@ -1336,10 +1289,18 @@ class MountControlApp(ctk.CTk):
         rate = int(round(float(val)))
         self._rate_lbl.configure(text=str(rate))
         if self.mount and self.mount.connected:
-            try:
-                self.mount.set_slew_rate(rate)
-            except Exception:
-                pass
+            # Cancel any pending rate-change and schedule a new one (debounce)
+            if hasattr(self, "_rate_after_id") and self._rate_after_id:
+                self.after_cancel(self._rate_after_id)
+            def _send(r=rate):
+                self._rate_after_id = None
+                def _worker():
+                    try:
+                        self.mount.set_slew_rate(r)
+                    except Exception:
+                        pass
+                threading.Thread(target=_worker, daemon=True).start()
+            self._rate_after_id = self.after(200, _send)
 
     # ── Tracking ───────────────────────────────────────────────────────────────
 
@@ -1348,26 +1309,40 @@ class MountControlApp(ctk.CTk):
         label = self._track_rate_var.get()
         self.log(f"Tracking rate selected: {label}")
         if self._tracking_on and self.mount and self.mount.connected:
-            try:
-                self.mount.set_tracking_rate(code)
-            except Exception as exc:
-                self.log(f"Rate change error: {exc}", PAL["danger"])
+            def _worker():
+                try:
+                    self.mount.set_tracking_rate(code)
+                except Exception as exc:
+                    self.after(0, lambda e=exc: self.log(f"Rate change error: {e}", PAL["danger"]))
+            threading.Thread(target=_worker, daemon=True).start()
 
     def _toggle_tracking(self):
         if not self._check_connected(): return
         self._tracking_on = not self._tracking_on
-        try:
-            if self._tracking_on:
-                self.mount.set_tracking_rate(self._tracking_rate)
-                self.mount.tracking_on()
-                self.log(f"Tracking ON  [{self._track_rate_var.get()}]", PAL["success"])
-            else:
-                self.mount.tracking_off()
-                self.log("Tracking OFF.", PAL["muted"])
-        except Exception as exc:
-            self._tracking_on = not self._tracking_on   # revert
-            self.log(f"Tracking error: {exc}", PAL["danger"])
+        self._update_track_ui()   # update UI immediately; revert on error
+        tracking_on = self._tracking_on
+        rate_code   = self._tracking_rate
+
+        def _worker():
+            try:
+                if tracking_on:
+                    self.mount.set_tracking_rate(rate_code)
+                    self.mount.tracking_on()
+                    label = self._track_rate_var.get()
+                    self.after(0, lambda l=label: self.log(f"Tracking ON  [{l}]", PAL["success"]))
+                else:
+                    self.mount.tracking_off()
+                    self.after(0, lambda: self.log("Tracking OFF.", PAL["muted"]))
+            except Exception as exc:
+                # Revert the toggle on error
+                self.after(0, lambda e=exc: self._tracking_error(e))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _tracking_error(self, exc):
+        self._tracking_on = not self._tracking_on   # revert
         self._update_track_ui()
+        self.log(f"Tracking error: {exc}", PAL["danger"])
 
     def _update_track_ui(self):
         if self._tracking_on:
@@ -1392,28 +1367,37 @@ class MountControlApp(ctk.CTk):
         if not self._check_connected(): return
         if direction in self._nudge_active: return
         self._nudge_active.add(direction)
-        try:
-            self.mount.move_direction(direction, True)
-            axis = "Dec" if direction in ("n", "s") else "RA"
-            sign = "+" if direction in ("s", "w") else "−"
-            self.log(f"Nudge {axis}{sign} — moving…")
-            if direction in self._nudge_btns:
-                self._nudge_btns[direction].configure(fg_color=PAL["accent"])
-        except Exception as exc:
-            self._nudge_active.discard(direction)
-            self.log(f"Error: {exc}", PAL["danger"])
+        axis = "Dec" if direction in ("n", "s") else "RA"
+        sign = "+" if direction in ("s", "w") else "−"
+        self.log(f"Nudge {axis}{sign} — moving…")
+        if direction in self._nudge_btns:
+            self._nudge_btns[direction].configure(fg_color=PAL["accent"])
+
+        def _worker():
+            try:
+                self.mount.move_direction(direction, True)
+            except Exception as exc:
+                self._nudge_active.discard(direction)
+                self.after(0, lambda e=exc: self.log(f"Error: {e}", PAL["danger"]))
+                if direction in self._nudge_btns:
+                    self.after(0, lambda d=direction: self._nudge_btns[d].configure(fg_color=PAL["entry_bg"]))
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _nudge_release(self, direction: str):
         self._nudge_active.discard(direction)
-        try:
-            self.mount.move_direction(direction, False)
-            axis = "Dec" if direction in ("n", "s") else "RA"
-            self.log(f"Nudge {axis} — stopped.")
-        except Exception:
-            pass
-        finally:
-            if direction in self._nudge_btns:
-                self._nudge_btns[direction].configure(fg_color=PAL["entry_bg"])
+        if direction in self._nudge_btns:
+            self._nudge_btns[direction].configure(fg_color=PAL["entry_bg"])
+
+        def _worker():
+            try:
+                self.mount.move_direction(direction, False)
+                axis = "Dec" if direction in ("n", "s") else "RA"
+                self.after(0, lambda a=axis: self.log(f"Nudge {a} — stopped."))
+            except Exception:
+                pass
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     # ── Live polling ───────────────────────────────────────────────────────────
 
@@ -1497,16 +1481,6 @@ class MountControlApp(ctk.CTk):
 
     # ── Plate Solve Calibration ────────────────────────────────────────────────
 
-    def _set_pier_side(self, side: str):
-        """Toggle pier side button highlight. side='0'=East, '1'=West."""
-        self._ps_pier_var.set(side)
-        if side == "0":
-            self._pier_east_btn.configure(fg_color=PAL["accent2"])
-            self._pier_west_btn.configure(fg_color=PAL["entry_bg"])
-        else:
-            self._pier_west_btn.configure(fg_color=PAL["accent2"])
-            self._pier_east_btn.configure(fg_color=PAL["entry_bg"])
-
     def _calibrate_plate_solve(self):
         if not self._check_connected():
             return
@@ -1524,23 +1498,20 @@ class MountControlApp(ctk.CTk):
 
         ra_hms  = _deg_to_hms(ra_deg)
         dec_dms = _deg_to_dms(dec_deg)
-        pier    = self._ps_pier_var.get()
-        pier_label = "West" if pier == "1" else "East"
-        self.log(f"[Plate Solve Cal]  :SRA \u2192 {ra_hms}  :Sd \u2192 {dec_dms}  Pier: {pier_label}", PAL["accent"])
+        self.log(f"[Plate Solve Cal]  :SRA → {ra_hms}  :Sd → {dec_dms}", PAL["accent"])
 
         def _worker():
             try:
                 r1 = self.mount.send_command(f":SRA{_encode_ra(ra_deg)}#")
                 r2 = self.mount.send_command(f":Sd{_encode_dec(dec_deg)}#")
                 if r1[:1] != "1" or r2[:1] != "1":
-                    msg = f"Mount rejected RA/Dec (SRA\u2192{r1}, Sd\u2192{r2})"
+                    msg = f"Mount rejected RA/Dec (SRA→{r1}, Sd→{r2})"
                     self.after(0, lambda m=msg: self.log(m, PAL["danger"]))
                     return
-                self.mount.send_command(f":SPS{pier}#")
                 resp = self.mount.send_command(":CM#")
                 ok   = resp[:1] == "1"
-                msg  = ("Calibration accepted (:CM# \u2192 1)." if ok
-                        else f"Calibration failed (:CM# \u2192 {resp}).")
+                msg  = ("Calibration accepted (:CM# → 1)." if ok
+                        else f"Calibration failed (:CM# → {resp}).")
                 col  = PAL["success"] if ok else PAL["danger"]
                 self.after(0, lambda m=msg, c=col: self.log(m, c))
             except Exception as exc:
