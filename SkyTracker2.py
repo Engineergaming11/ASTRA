@@ -68,14 +68,39 @@ def is_above_horizon(target_star=None, body_key=None):
     return above, alt.degrees, az.degrees
 
 
+# Hardcoded Star objects for bright stars that saturate the Tycho-2 detector
+# (Tycho-2 has no valid data for stars brighter than VT ~1.9)
+# Coordinates and proper motions from Hipparcos catalog (J2000, ICRS)
+# Rigel is excluded — it has valid data in updatedTycho2.parquet
+FALLBACK_STARS = {
+    "4628 00237 1": Star(ra_hours=2.5303,   dec_degrees=89.2641,  ra_mas_per_year=44.22,    dec_mas_per_year=-11.74),  # Polaris
+    "0699 00076 1": Star(ra_hours=18.6156,  dec_degrees=38.7837,  ra_mas_per_year=200.94,   dec_mas_per_year=286.23),  # Vega
+    "0129 01873 1": Star(ra_hours=5.9195,   dec_degrees=7.4071,   ra_mas_per_year=26.42,    dec_mas_per_year=9.60),    # Betelgeuse
+    "0764 01708 1": Star(ra_hours=5.2781,   dec_degrees=45.9980,  ra_mas_per_year=75.52,    dec_mas_per_year=-427.13), # Capella
+    "1868 01462 1": Star(ra_hours=7.5766,   dec_degrees=31.8883,  ra_mas_per_year=-206.33,  dec_mas_per_year=-148.18), # Castor
+    "1871 01197 1": Star(ra_hours=7.7553,   dec_degrees=28.0262,  ra_mas_per_year=-625.69,  dec_mas_per_year=-45.95),  # Pollux
+    "4439 00803 1": Star(ra_hours=14.8449,  dec_degrees=74.1555,  ra_mas_per_year=-32.61,   dec_mas_per_year=11.42),   # Kochab
+    "2985 01922 1": Star(ra_hours=14.2610,  dec_degrees=19.1822,  ra_mas_per_year=-1093.45, dec_mas_per_year=-1999.40),# Arcturus
+    "6241 01527 1": Star(ra_hours=16.4901,  dec_degrees=-26.4320, ra_mas_per_year=-10.16,   dec_mas_per_year=-23.21),  # Antares
+}
+
 # PRESET STARS
 TYCHO_PRESET_STARS = {
-    "Avior": "8579 02692 1",
+    "Polaris":     "4628 00237 1",
+    "Vega":        "0699 00076 1",
+    "Betelgeuse":  "0129 01873 1",
+    "Rigel":       "5331 01752 1",
+    "Capella":     "0764 01708 1",
+    "Castor":      "1868 01462 1",
+    "Pollux":      "1871 01197 1",
+    "Kochab":      "4439 00803 1",
+    "Arcturus":    "2985 01922 1",
+    "Antares":     "6241 01527 1",
+    "Avior":       "8579 02692 1",
     "Miaplacidus": "9200 02603 1",
-    "Regulus": "0833 01381 1",
-    "Rigel": "5331 01752 1",
-    "Alioth": "3845 01190 1",
-    "Alkaid": "3467 01257 1",
+    "Regulus":     "0833 01381 1",
+    "Alioth":      "3845 01190 1",
+    "Alkaid":      "3467 01257 1",
 }
 
 # SOLAR SYSTEM BODIES
@@ -94,6 +119,15 @@ SOLAR_SYSTEM_BODIES = {
 NEBULAE = {}
 DESCRIPTIONS = {
     # STARS
+    "Polaris": "Polaris (Alpha Ursae Minoris) is the current North Star, located less than 1° from the celestial north pole. It's a Cepheid variable supergiant about 433 light-years away, making it invaluable for navigation.",
+    "Vega": "Vega (Alpha Lyrae) is the brightest star in Lyra and the fifth-brightest in the night sky. At just 25 light-years away, it was the first star other than the Sun to be photographed and to have its spectrum recorded.",
+    "Betelgeuse": "Betelgeuse (Alpha Orionis) is a red supergiant in Orion and one of the largest stars visible to the naked eye. It's a semi-regular variable star about 700 light-years away and a candidate for a future supernova.",
+    "Capella": "Capella (Alpha Aurigae) is the brightest star in Auriga and the sixth-brightest in the night sky. It's actually a quadruple star system — two pairs of binary stars — located about 43 light-years away.",
+    "Castor": "Castor (Alpha Geminorum) is the second-brightest star in Gemini. Despite appearing as a single star, it's actually a sextuple system — three pairs of binary stars — located about 52 light-years away.",
+    "Pollux": "Pollux (Beta Geminorum) is the brightest star in Gemini and one of the nearest giant stars to Earth at 34 light-years. It hosts a confirmed exoplanet, Pollux b, a Jupiter-mass planet in a 590-day orbit.",
+    "Kochab": "Kochab (Beta Ursae Minoris) is the brightest star in the bowl of the Little Dipper and was the pole star around 1500 BC due to precession. It's an orange giant about 131 light-years away.",
+    "Arcturus": "Arcturus (Alpha Bootis) is the brightest star in Boötes and the fourth-brightest in the night sky at −0.05 magnitude. This orange giant is just 37 light-years away and notable for its very high proper motion.",
+    "Antares": "Antares (Alpha Scorpii) is the brightest star in Scorpius and a red supergiant about 550 light-years away. Its name means 'rival of Mars' due to its similar reddish color. It's one of the largest stars visible to the naked eye.",
     "Avior": "Avior (Epsilon Carinae) is a binary star system in the constellation Carina. It's one of the brightest stars in the southern sky and serves as one of the 57 navigational stars.",
     "Miaplacidus": "Miaplacidus (Beta Carinae) is the second-brightest star in Carina. Its name comes from Arabic meaning 'the waters'. It's a white giant star located about 113 light-years away.",
     "Regulus": "Regulus (Alpha Leonis) is the brightest star in Leo and one of the brightest in the night sky. Known as 'the heart of the lion', it's actually a multiple star system rotating rapidly.",
@@ -431,15 +465,21 @@ class StarTrackerGUI:
             self.track_target()
 
     def tycho_lookup(self, tyc_id):
+        # Return hardcoded Star object for bright stars that saturate Tycho-2
+        if tyc_id in FALLBACK_STARS:
+            return FALLBACK_STARS[tyc_id]
+        # Otherwise look up in catalog, defaulting NaN proper motions to 0
         match = catalog.loc[catalog["TYC_ID"].str.strip() == tyc_id]
         if match.empty:
             return None
         r = match.iloc[0]
+        pm_ra  = r["pmRA_masyr"]  if pd.notna(r["pmRA_masyr"])  else 0.0
+        pm_dec = r["pmDec_masyr"] if pd.notna(r["pmDec_masyr"]) else 0.0
         return Star(
             ra_hours=r["RA_deg"] / 15.0,
             dec_degrees=r["Dec_deg"],
-            ra_mas_per_year=r["pmRA_masyr"],
-            dec_mas_per_year=r["pmDec_masyr"],
+            ra_mas_per_year=pm_ra,
+            dec_mas_per_year=pm_dec,
         )
 
     @staticmethod
@@ -497,6 +537,7 @@ class StarTrackerGUI:
         self.output_text.insert("1.0", f"RA : {ra.hstr()}\nDEC: {dec.dstr()}{az_alt_lines}\n")
         self.output_text.config(state=tk.DISABLED)
 
+    def log_to_console(self, ra, dec, object_name="Unknown"):
         timestamp = datetime.now().strftime("%H:%M:%S")
         print(f"[{timestamp}] {object_name} | RA: {ra.hstr()} | DEC: {dec.dstr()}", flush=True)
 
