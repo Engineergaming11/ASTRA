@@ -686,9 +686,16 @@ class StarTrackerGUI:
 
     def live_update(self):
         """Continuous update loop for tracking"""
+        # Use a topocentric observer (Earth center + Tucson location).
+        # This is essential for the Moon, where lunar parallax can shift the
+        # apparent RA/Dec by up to ~1° from the geocentric position.
+        # The effect is negligible for the Sun, planets, stars, and Messier objects,
+        # but using the topocentric observer for everything is correct and consistent.
+        observer = eph["earth"] + UA_OBSERVER
+        t = ts.now()
+
         if self.active_mode in ("star", "messier") and self.cached_star:
-            t = ts.now()
-            ra, dec, _ = eph["earth"].at(t).observe(self.cached_star).apparent().radec("date")
+            ra, dec, _ = observer.at(t).observe(self.cached_star).apparent().radec("date")
 
             if self.active_mode == "star":
                 object_name = next(
@@ -705,8 +712,7 @@ class StarTrackerGUI:
 
         elif self.active_mode == "body":
             body = eph[self.active_target]
-            t = ts.now()
-            ra, dec, _ = eph["earth"].at(t).observe(body).apparent().radec("date")
+            ra, dec, _ = observer.at(t).observe(body).apparent().radec("date")
 
             object_name = next(
                 (name for name, key in SOLAR_SYSTEM_BODIES.items() if key == self.active_target),
