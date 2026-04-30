@@ -1,0 +1,9 @@
+.DS_Store
+.venv/
+.venv.bak/
+__pycache__/
+*.py[cod]
+
+# Large data / ephemeris — download separately (exceed GitHub size limits)
+de440.bsp
+UpdatedTycho2.parquet

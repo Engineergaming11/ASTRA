@@ -1,14 +1,27 @@
 import tkinter as tk
 from tkinter import ttk
 import customtkinter as ctk
-import pandas as pd
 import numpy as np
-from skyfield.api import Star, load, wgs84
-from skyfield.units import Angle
+from skyfield.api import Star
 from datetime import datetime
 import sys
-import json
-import os
+
+from sky_ephemeris import (
+    DEFAULT_ELEV_M,
+    DEFAULT_LAT,
+    DEFAULT_LON,
+    DESCRIPTIONS,
+    NEBULAE,
+    SOLAR_SYSTEM_BODIES,
+    TYCHO_PRESET_STARS,
+    catalog,
+    eph,
+    get_messier_coordinates,
+    is_above_horizon,
+    ts,
+    write_livewcs,
+    livewcs_path,
+)
 
 # THEME CONFIGURATION
 THEMES = {
@@ -40,162 +53,7 @@ THEMES = {
     }
 }
 
-# CATALOGS AND EPHEMERIS
-catalog = pd.read_parquet("updatedTycho2.parquet")
-messier_catalog = pd.read_parquet("Messier_Updated.parquet")
-ts = load.timescale()
-eph = load("de440.bsp")
-
-WCS_PATH = "LiveWCS.txt"
-
-# University of Arizona, Tucson — Steward Observatory coordinates
-UA_OBSERVER = wgs84.latlon(32.2329, -110.9479, elevation_m=728)
-
-
-def is_above_horizon(target_star=None, body_key=None):
-    t = ts.now()
-    observer = eph["earth"] + UA_OBSERVER
-
-    if target_star is not None:
-        astrometric = observer.at(t).observe(target_star).apparent()
-    elif body_key is not None:
-        astrometric = observer.at(t).observe(eph[body_key]).apparent()
-    else:
-        raise ValueError("Provide either target_star or body_key")
-
-    alt, az, _ = astrometric.altaz()
-    above = alt.degrees > 0
-    return above, alt.degrees, az.degrees
-
-
-# Hardcoded Star objects for bright stars that saturate the Tycho-2 detector
-# (Tycho-2 has no valid data for stars brighter than VT ~1.9)
-# Coordinates and proper motions from Hipparcos catalog (J2000, ICRS)
-# Rigel is excluded — it has valid data in updatedTycho2.parquet
-FALLBACK_STARS = {
-    "4628 00237 1": Star(ra_hours=2.5303,   dec_degrees=89.2641,  ra_mas_per_year=44.22,    dec_mas_per_year=-11.74),  # Polaris
-    "0699 00076 1": Star(ra_hours=18.6156,  dec_degrees=38.7837,  ra_mas_per_year=200.94,   dec_mas_per_year=286.23),  # Vega
-    "0129 01873 1": Star(ra_hours=5.9195,   dec_degrees=7.4071,   ra_mas_per_year=26.42,    dec_mas_per_year=9.60),    # Betelgeuse
-    "0764 01708 1": Star(ra_hours=5.2781,   dec_degrees=45.9980,  ra_mas_per_year=75.52,    dec_mas_per_year=-427.13), # Capella
-    "1868 01462 1": Star(ra_hours=7.5766,   dec_degrees=31.8883,  ra_mas_per_year=-206.33,  dec_mas_per_year=-148.18), # Castor
-    "1871 01197 1": Star(ra_hours=7.7553,   dec_degrees=28.0262,  ra_mas_per_year=-625.69,  dec_mas_per_year=-45.95),  # Pollux
-    "4439 00803 1": Star(ra_hours=14.8449,  dec_degrees=74.1555,  ra_mas_per_year=-32.61,   dec_mas_per_year=11.42),   # Kochab
-    "2985 01922 1": Star(ra_hours=14.2610,  dec_degrees=19.1822,  ra_mas_per_year=-1093.45, dec_mas_per_year=-1999.40),# Arcturus
-    "6241 01527 1": Star(ra_hours=16.4901,  dec_degrees=-26.4320, ra_mas_per_year=-10.16,   dec_mas_per_year=-23.21),  # Antares
-}
-
-# PRESET STARS
-TYCHO_PRESET_STARS = {
-    "Polaris":     "4628 00237 1",
-    "Vega":        "0699 00076 1",
-    "Betelgeuse":  "0129 01873 1",
-    "Rigel":       "5331 01752 1",
-    "Capella":     "0764 01708 1",
-    "Castor":      "1868 01462 1",
-    "Pollux":      "1871 01197 1",
-    "Kochab":      "4439 00803 1",
-    "Arcturus":    "2985 01922 1",
-    "Antares":     "6241 01527 1",
-    "Avior":       "8579 02692 1",
-    "Miaplacidus": "9200 02603 1",
-    "Regulus":     "0833 01381 1",
-    "Alioth":      "3845 01190 1",
-    "Alkaid":      "3467 01257 1",
-}
-
-# SOLAR SYSTEM BODIES
-SOLAR_SYSTEM_BODIES = {
-    "Sun": "sun",
-    "Moon": "moon",
-    "Mercury": "mercury",
-    "Venus": "venus",
-    "Mars": "mars barycenter",
-    "Jupiter": "jupiter barycenter",
-    "Saturn": "saturn barycenter",
-    "Uranus": "uranus barycenter",
-    "Neptune": "neptune barycenter",
-}
-
-NEBULAE = {}
-DESCRIPTIONS = {
-    # STARS
-    "Polaris": "Polaris (Alpha Ursae Minoris) is the current North Star, located less than 1° from the celestial north pole. It's a Cepheid variable supergiant about 433 light-years away, making it invaluable for navigation.",
-    "Vega": "Vega (Alpha Lyrae) is the brightest star in Lyra and the fifth-brightest in the night sky. At just 25 light-years away, it was the first star other than the Sun to be photographed and to have its spectrum recorded.",
-    "Betelgeuse": "Betelgeuse (Alpha Orionis) is a red supergiant in Orion and one of the largest stars visible to the naked eye. It's a semi-regular variable star about 700 light-years away and a candidate for a future supernova.",
-    "Capella": "Capella (Alpha Aurigae) is the brightest star in Auriga and the sixth-brightest in the night sky. It's actually a quadruple star system — two pairs of binary stars — located about 43 light-years away.",
-    "Castor": "Castor (Alpha Geminorum) is the second-brightest star in Gemini. Despite appearing as a single star, it's actually a sextuple system — three pairs of binary stars — located about 52 light-years away.",
-    "Pollux": "Pollux (Beta Geminorum) is the brightest star in Gemini and one of the nearest giant stars to Earth at 34 light-years. It hosts a confirmed exoplanet, Pollux b, a Jupiter-mass planet in a 590-day orbit.",
-    "Kochab": "Kochab (Beta Ursae Minoris) is the brightest star in the bowl of the Little Dipper and was the pole star around 1500 BC due to precession. It's an orange giant about 131 light-years away.",
-    "Arcturus": "Arcturus (Alpha Bootis) is the brightest star in Boötes and the fourth-brightest in the night sky at −0.05 magnitude. This orange giant is just 37 light-years away and notable for its very high proper motion.",
-    "Antares": "Antares (Alpha Scorpii) is the brightest star in Scorpius and a red supergiant about 550 light-years away. Its name means 'rival of Mars' due to its similar reddish color. It's one of the largest stars visible to the naked eye.",
-    "Avior": "Avior (Epsilon Carinae) is a binary star system in the constellation Carina. It's one of the brightest stars in the southern sky and serves as one of the 57 navigational stars.",
-    "Miaplacidus": "Miaplacidus (Beta Carinae) is the second-brightest star in Carina. Its name comes from Arabic meaning 'the waters'. It's a white giant star located about 113 light-years away.",
-    "Regulus": "Regulus (Alpha Leonis) is the brightest star in Leo and one of the brightest in the night sky. Known as 'the heart of the lion', it's actually a multiple star system rotating rapidly.",
-    "Rigel": "Rigel (Beta Orionis) is a blue supergiant star in Orion. Despite being designated Beta, it's usually the brightest star in the constellation. It's approximately 860 light-years away.",
-    "Alioth": "Alioth (Epsilon Ursae Majoris) is the brightest star in Ursa Major (the Big Dipper). It's 81 light-years away and has a peculiar magnetic field.",
-    "Alkaid": "Alkaid (Eta Ursae Majoris) forms the end of the Big Dipper's handle. It's a young, hot blue star about 100 light-years away, one of the hottest visible to the naked eye.",
-    # SOLAR SYSTEM BODIES
-    "Sun": "The Sun is the star at the center of our Solar System. It's a nearly perfect sphere of hot plasma, about 4.6 billion years old, and contains 99.86% of the Solar System's mass.",
-    "Moon": "Earth's Moon is the fifth-largest natural satellite in the Solar System. It's about 1/4 the diameter of Earth and is the brightest object in our night sky after the Sun.",
-    "Mercury": "Mercury is the smallest planet and closest to the Sun. It has no atmosphere and experiences extreme temperature variations. One day on Mercury lasts 59 Earth days.",
-    "Venus": "Venus is the second planet from the Sun and Earth's closest planetary neighbor. It's similar in size to Earth but has a thick, toxic atmosphere that traps heat, making it the hottest planet.",
-    "Mars": "Mars, the Red Planet, is the fourth planet from the Sun. It has polar ice caps, extinct volcanoes, and evidence of ancient water flows. It's a prime target for exploration and potential colonization.",
-    "Jupiter": "Jupiter is the largest planet in our Solar System, more than twice as massive as all other planets combined. It has a Great Red Spot storm and at least 95 known moons.",
-    "Saturn": "Saturn is the sixth planet and second-largest in our Solar System. It's famous for its spectacular ring system made of ice and rock particles. It has 146 confirmed moons.",
-    "Uranus": "Uranus is an ice giant that rotates on its side, likely due to an ancient collision. It has a blue-green color from methane in its atmosphere and 27 known moons.",
-    "Neptune": "Neptune is the farthest planet from the Sun and has the strongest winds in the Solar System. It's an ice giant with a deep blue color and 16 known moons.",
-    # NEBULAE
-    "Orion Nebula": "M42, the Orion Nebula, is a diffuse nebula in the Milky Way, located 1,344 light-years away. It's one of the brightest nebulae visible to the naked eye and a stellar nursery where new stars are forming.",
-    "Eagle Nebula": "M16, the Eagle Nebula, is a young open cluster of stars in Serpens, about 7,000 light-years away. It's famous for the 'Pillars of Creation' photographed by the Hubble Space Telescope.",
-    "Crab Nebula": "M1, the Crab Nebula, is a supernova remnant in Taurus, about 6,500 light-years away. It resulted from a supernova explosion observed in 1054 AD and contains a pulsar at its center.",
-    "Ring Nebula": "M57, the Ring Nebula, is a planetary nebula in Lyra, about 2,300 light-years away. It's the expelled outer layers of a dying star, appearing as a colorful ring in telescopes.",
-    "Dumbbell Nebula": "M27, the Dumbbell Nebula, is a planetary nebula in Vulpecula, about 1,360 light-years away. It was the first planetary nebula to be discovered and is one of the brightest.",
-    "Helix Nebula": "NGC 7293, the Helix Nebula, is one of the closest planetary nebulae to Earth at 655 light-years away. Often called the 'Eye of God', it's a dying star's outer layers expanding into space.",
-}
-
-
-def load_messier_objects():
-    global NEBULAE
-    try:
-        for _, obj in messier_catalog.iterrows():
-            messier_id = obj['MESSIER_ID']
-            obj_type = obj.get('Type', '') if 'Type' in messier_catalog.columns else ''
-            display_name = f"{messier_id} - {obj_type}" if obj_type else messier_id
-            NEBULAE[display_name] = messier_id
-            desc = f"{messier_id} is a {obj_type} in the Messier catalog." if obj_type else f"{messier_id} is in the Messier catalog."
-            if 'Description' in messier_catalog.columns and pd.notna(obj.get('Description')):
-                desc = obj['Description']
-            elif 'Distance_ly' in messier_catalog.columns and pd.notna(obj.get('Distance_ly')):
-                distance = obj['Distance_ly']
-                desc = f"{messier_id} is a {obj_type} located approximately {distance:,.0f} light-years away." if obj_type else f"{messier_id} is located approximately {distance:,.0f} light-years away."
-            DESCRIPTIONS[display_name] = desc
-        print(f"Loaded {len(NEBULAE)} Messier objects from catalog")
-    except Exception as e:
-        print(f"Warning: Could not load Messier catalog: {e}")
-        import traceback
-        traceback.print_exc()
-        NEBULAE.update({
-            "Orion Nebula": "M42",
-            "Eagle Nebula": "M16",
-            "Crab Nebula": "M1",
-            "Ring Nebula": "M57",
-            "Dumbbell Nebula": "M27",
-        })
-
-
-def get_messier_coordinates(messier_id):
-    try:
-        match = messier_catalog[messier_catalog['MESSIER_ID'] == messier_id]
-        if match.empty:
-            return None, None
-        obj = match.iloc[0]
-        return obj['RA_deg'], obj['Dec_deg']
-    except Exception as e:
-        print(f"Error getting coordinates for {messier_id}: {e}")
-        return None, None
-
-
-load_messier_objects()
+WCS_PATH = str(livewcs_path())
 
 
 class StarTrackerGUI:
@@ -465,21 +323,15 @@ class StarTrackerGUI:
             self.track_target()
 
     def tycho_lookup(self, tyc_id):
-        # Return hardcoded Star object for bright stars that saturate Tycho-2
-        if tyc_id in FALLBACK_STARS:
-            return FALLBACK_STARS[tyc_id]
-        # Otherwise look up in catalog, defaulting NaN proper motions to 0
         match = catalog.loc[catalog["TYC_ID"].str.strip() == tyc_id]
         if match.empty:
             return None
         r = match.iloc[0]
-        pm_ra  = r["pmRA_masyr"]  if pd.notna(r["pmRA_masyr"])  else 0.0
-        pm_dec = r["pmDec_masyr"] if pd.notna(r["pmDec_masyr"]) else 0.0
         return Star(
             ra_hours=r["RA_deg"] / 15.0,
             dec_degrees=r["Dec_deg"],
-            ra_mas_per_year=pm_ra,
-            dec_mas_per_year=pm_dec,
+            ra_mas_per_year=r["pmRA_masyr"],
+            dec_mas_per_year=r["pmDec_masyr"],
         )
 
     @staticmethod
@@ -494,32 +346,19 @@ class StarTrackerGUI:
 
     def write_output(self, ra, dec, object_name="Unknown"):
         """Write coordinates to file atomically as JSON and update GUI"""
-        ra_deg = ra.hours * 15.0
-        dec_deg = dec.degrees
-        dec_wcs = dec.dstr().rstrip('"')
+        write_livewcs(WCS_PATH, ra, dec, object_name)
 
-        data = {
-            "object": object_name,
-            "ra_WCS": ra.hstr(),
-            "dec_WCS": dec_wcs,
-            "ra_deg": round(ra_deg, 6),
-            "dec_deg": round(dec_deg, 6),
-        }
-
-        tmp_path = WCS_PATH + ".tmp"
-        with open(tmp_path, "w") as f:
-            json.dump(data, f, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_path, WCS_PATH)
-
-        # Compute Az/Alt and display in live output box
+        # Compute Az/Alt and display in live output box (default Steward site)
         az_alt_lines = ""
         try:
             if self.active_mode in ("star", "messier") and self.cached_star is not None:
-                above, alt, az = is_above_horizon(target_star=self.cached_star)
+                above, alt, az = is_above_horizon(
+                    DEFAULT_LAT, DEFAULT_LON, DEFAULT_ELEV_M, target_star=self.cached_star
+                )
             elif self.active_mode == "body" and self.active_target:
-                above, alt, az = is_above_horizon(body_key=self.active_target)
+                above, alt, az = is_above_horizon(
+                    DEFAULT_LAT, DEFAULT_LON, DEFAULT_ELEV_M, body_key=self.active_target
+                )
             else:
                 above, alt, az = None, None, None
 
@@ -537,7 +376,6 @@ class StarTrackerGUI:
         self.output_text.insert("1.0", f"RA : {ra.hstr()}\nDEC: {dec.dstr()}{az_alt_lines}\n")
         self.output_text.config(state=tk.DISABLED)
 
-    def log_to_console(self, ra, dec, object_name="Unknown"):
         timestamp = datetime.now().strftime("%H:%M:%S")
         print(f"[{timestamp}] {object_name} | RA: {ra.hstr()} | DEC: {dec.dstr()}", flush=True)
 
@@ -686,16 +524,9 @@ class StarTrackerGUI:
 
     def live_update(self):
         """Continuous update loop for tracking"""
-        # Use a topocentric observer (Earth center + Tucson location).
-        # This is essential for the Moon, where lunar parallax can shift the
-        # apparent RA/Dec by up to ~1° from the geocentric position.
-        # The effect is negligible for the Sun, planets, stars, and Messier objects,
-        # but using the topocentric observer for everything is correct and consistent.
-        observer = eph["earth"] + UA_OBSERVER
-        t = ts.now()
-
         if self.active_mode in ("star", "messier") and self.cached_star:
-            ra, dec, _ = observer.at(t).observe(self.cached_star).apparent().radec("date")
+            t = ts.now()
+            ra, dec, _ = eph["earth"].at(t).observe(self.cached_star).apparent().radec("date")
 
             if self.active_mode == "star":
                 object_name = next(
@@ -712,7 +543,8 @@ class StarTrackerGUI:
 
         elif self.active_mode == "body":
             body = eph[self.active_target]
-            ra, dec, _ = observer.at(t).observe(body).apparent().radec("date")
+            t = ts.now()
+            ra, dec, _ = eph["earth"].at(t).observe(body).apparent().radec("date")
 
             object_name = next(
                 (name for name, key in SOLAR_SYSTEM_BODIES.items() if key == self.active_target),

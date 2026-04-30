@@ -23,21 +23,138 @@ Dependencies (same as before + astropy, sep):
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import numpy as np
-from PIL import Image, ImageTk, ImageDraw
+from PIL import Image, ImageTk, ImageDraw, ImageFont
 import threading
 import subprocess
 import glob
 import os
+import shutil
+from datetime import datetime
 from pathlib import Path
 import time
 import traceback
 
 from astropy.io import fits
 from astropy.wcs import WCS
+from astropy.coordinates import SkyCoord
 import astropy.units as u
 import sep
 
 SOLVE_FIELD_CMD = "solve-field"
+
+
+def _preferred_astrometry_data_dir() -> Path:
+    return Path.home() / "astrometry" / "data"
+
+
+def _candidate_astrometry_cfg_paths() -> list[Path]:
+    paths = [Path("/opt/homebrew/etc/astrometry.cfg")]
+    cellar = Path("/opt/homebrew/Cellar/astrometry-net")
+    if cellar.exists():
+        for ver in sorted(cellar.iterdir(), reverse=True):
+            cfg = ver / "etc" / "astrometry.cfg"
+            if cfg.exists():
+                paths.append(cfg)
+                break
+    return paths
+
+
+def _normalize_astrometry_cfg_path_line(cfg_path: Path, preferred_data_dir: Path) -> tuple[bool, str]:
+    """Ensure add_path points to an existing stable user-writable directory."""
+    try:
+        content = cfg_path.read_text(encoding="utf-8")
+    except Exception as e:
+        return False, f"Could not read {cfg_path}: {e}"
+    lines = content.splitlines()
+    add_idx = None
+    current = None
+    for i, line in enumerate(lines):
+        s = line.strip()
+        if s.startswith("add_path "):
+            add_idx = i
+            current = s.split(" ", 1)[1].strip()
+            break
+    preferred_line = f"add_path {preferred_data_dir}"
+    if add_idx is None:
+        lines.insert(0, preferred_line)
+    else:
+        old_path = Path(current).expanduser() if current else None
+        old_exists = bool(old_path and old_path.exists())
+        if old_exists and str(old_path) == str(preferred_data_dir):
+            return True, f"Astrometry config already uses {preferred_data_dir}"
+        if old_exists and str(old_path) != str(preferred_data_dir):
+            # Keep valid user path chosen by user.
+            return True, f"Astrometry config keeps existing valid path {old_path}"
+        lines[add_idx] = preferred_line
+    new_content = "\n".join(lines) + ("\n" if content.endswith("\n") or not lines else "")
+    if new_content == content:
+        return True, f"Astrometry config unchanged at {cfg_path}"
+    try:
+        cfg_path.write_text(new_content, encoding="utf-8")
+    except Exception as e:
+        return False, f"Could not update {cfg_path}: {e}"
+    return True, f"Updated {cfg_path} add_path -> {preferred_data_dir}"
+
+
+def ensure_astrometry_runtime_setup() -> dict:
+    """
+    Best-effort local setup:
+    - create ~/astrometry/data
+    - repoint astrometry cfg add_path away from broken Cellar data paths
+    """
+    preferred = _preferred_astrometry_data_dir()
+    status_lines = []
+    try:
+        preferred.mkdir(parents=True, exist_ok=True)
+        status_lines.append(f"Using astrometry data dir: {preferred}")
+    except Exception as e:
+        status_lines.append(f"Could not create astrometry data dir {preferred}: {e}")
+    cfg_updated = False
+    for cfg in _candidate_astrometry_cfg_paths():
+        if not cfg.exists():
+            continue
+        ok, msg = _normalize_astrometry_cfg_path_line(cfg, preferred)
+        status_lines.append(msg)
+        cfg_updated = cfg_updated or ok
+        # first valid config is enough for Homebrew install.
+        if ok:
+            break
+    index_count = len(list(preferred.glob("index-*.fits"))) if preferred.exists() else 0
+    status_lines.append(f"Found {index_count} index file(s) in {preferred}")
+    return {"data_dir": str(preferred), "index_count": index_count, "messages": status_lines, "cfg_checked": cfg_updated}
+
+_BRIGHT_STAR_CATALOG = [
+    {"name": "Sirius", "ra_deg": 101.287155, "dec_deg": -16.716116, "distance_ly": 8.6},
+    {"name": "Canopus", "ra_deg": 95.987958, "dec_deg": -52.695661, "distance_ly": 310.0},
+    {"name": "Arcturus", "ra_deg": 213.915300, "dec_deg": 19.182410, "distance_ly": 36.7},
+    {"name": "Vega", "ra_deg": 279.234734, "dec_deg": 38.783688, "distance_ly": 25.0},
+    {"name": "Capella", "ra_deg": 79.172327, "dec_deg": 45.997991, "distance_ly": 42.9},
+    {"name": "Rigel", "ra_deg": 78.634467, "dec_deg": -8.201639, "distance_ly": 860.0},
+    {"name": "Procyon", "ra_deg": 114.825493, "dec_deg": 5.224993, "distance_ly": 11.5},
+    {"name": "Betelgeuse", "ra_deg": 88.792939, "dec_deg": 7.407064, "distance_ly": 548.0},
+    {"name": "Achernar", "ra_deg": 24.428611, "dec_deg": -57.236753, "distance_ly": 139.0},
+    {"name": "Hadar", "ra_deg": 210.955833, "dec_deg": -60.373056, "distance_ly": 390.0},
+    {"name": "Altair", "ra_deg": 297.695828, "dec_deg": 8.868322, "distance_ly": 16.7},
+    {"name": "Acrux", "ra_deg": 186.649563, "dec_deg": -63.099092, "distance_ly": 321.0},
+    {"name": "Aldebaran", "ra_deg": 68.980163, "dec_deg": 16.509302, "distance_ly": 65.0},
+    {"name": "Antares", "ra_deg": 247.351915, "dec_deg": -26.432002, "distance_ly": 550.0},
+    {"name": "Spica", "ra_deg": 201.298247, "dec_deg": -11.161322, "distance_ly": 250.0},
+    {"name": "Pollux", "ra_deg": 116.328958, "dec_deg": 28.026183, "distance_ly": 33.7},
+    {"name": "Fomalhaut", "ra_deg": 344.412750, "dec_deg": -29.622236, "distance_ly": 25.1},
+    {"name": "Deneb", "ra_deg": 310.357979, "dec_deg": 45.280339, "distance_ly": 2615.0},
+    {"name": "Regulus", "ra_deg": 152.092962, "dec_deg": 11.967208, "distance_ly": 79.0},
+    {"name": "Adhara", "ra_deg": 104.656453, "dec_deg": -28.972086, "distance_ly": 430.0},
+    {"name": "Shaula", "ra_deg": 263.402167, "dec_deg": -37.103824, "distance_ly": 570.0},
+    {"name": "Castor", "ra_deg": 113.649345, "dec_deg": 31.888282, "distance_ly": 51.6},
+    {"name": "Gacrux", "ra_deg": 187.791498, "dec_deg": -57.113214, "distance_ly": 88.6},
+    {"name": "Bellatrix", "ra_deg": 81.282764, "dec_deg": 6.349703, "distance_ly": 250.0},
+    {"name": "Elnath", "ra_deg": 81.572971, "dec_deg": 28.607451, "distance_ly": 131.0},
+    {"name": "Miaplacidus", "ra_deg": 138.300833, "dec_deg": -69.717222, "distance_ly": 111.0},
+    {"name": "Alnilam", "ra_deg": 84.053389, "dec_deg": -1.201917, "distance_ly": 1340.0},
+    {"name": "Alnair", "ra_deg": 332.058271, "dec_deg": -46.960975, "distance_ly": 101.0},
+    {"name": "Alioth", "ra_deg": 193.507292, "dec_deg": 55.959822, "distance_ly": 82.6},
+    {"name": "Alnitak", "ra_deg": 85.189694, "dec_deg": -1.942572, "distance_ly": 736.0},
+]
 
 # Color schemes
 THEMES = {
@@ -71,38 +188,155 @@ THEMES = {
 
 # ---------- Utility functions ----------
 
+def _index_scale_ranges_arcmin() -> list[tuple[int, float, float]]:
+    """Skymark diameter ranges (arcmin) per 4XXY scale digit, per astrometry.net docs."""
+    return [
+        (0, 2.0, 2.8),
+        (1, 2.8, 4.0),
+        (2, 4.0, 5.6),
+        (3, 5.6, 8.0),
+        (4, 8.0, 11.0),
+        (5, 11.0, 16.0),
+        (6, 16.0, 22.0),
+        (7, 22.0, 30.0),
+        (8, 30.0, 42.0),
+        (9, 42.0, 60.0),
+        (10, 60.0, 85.0),
+        (11, 85.0, 120.0),
+        (12, 120.0, 170.0),
+        (13, 170.0, 240.0),
+        (14, 240.0, 340.0),
+        (15, 340.0, 480.0),
+        (16, 480.0, 680.0),
+        (17, 680.0, 1000.0),
+        (18, 1000.0, 1400.0),
+        (19, 1400.0, 2000.0),
+    ]
+
+
+def _scales_recommended_for_fov(fov_deg: float, low_frac: float = 0.25, high_frac: float = 1.0) -> list[int]:
+    """Return 4XXY scale digits whose skymark range overlaps the chosen FOV fractions.
+
+    Default 25%-100% of FOV is a practical sweet spot: small enough to download
+    (avoiding the 48-tile families at the smallest scales when not strictly needed)
+    while still giving solve-field plenty of usable quads.
+    """
+    if fov_deg is None or fov_deg <= 0:
+        return [5, 6, 7, 8]
+    fov_arcmin = float(fov_deg) * 60.0
+    lo, hi = fov_arcmin * low_frac, fov_arcmin * high_frac
+    chosen = [s for s, a, b in _index_scale_ranges_arcmin() if b >= lo and a <= hi]
+    return chosen or [5, 6, 7, 8]
+
+
+def _installed_index_scales(data_dir: Path) -> set[int]:
+    """Collect the 4XXY scale digits present in `data_dir` (4200-series naming)."""
+    scales: set[int] = set()
+    if not data_dir.exists():
+        return scales
+    for p in data_dir.glob("index-42*.fits"):
+        stem = p.stem  # e.g. index-4205-03 or index-4208
+        try:
+            parts = stem.split("-")
+            family_token = parts[1]  # 4205, 4208, 4210, ...
+            digits = family_token[2:]  # "05", "08", "10", ...
+            scale = int(digits)
+            scales.add(scale)
+        except (IndexError, ValueError):
+            continue
+    return scales
+
+
 def run_solve_field_local(image_path, ra, dec, fov_deg, out_basename, solve_field_cmd=SOLVE_FIELD_CMD, timeout=300):
-    """Run local astrometry.net solve-field with RA/DEC/FOV hints."""
+    """Run local astrometry.net solve-field with robust fallbacks."""
     image_path = Path(image_path).resolve()
     out_dir = image_path.parent
     out_basename_path = out_dir / out_basename
+    setup_info = ensure_astrometry_runtime_setup()
+    setup_log = "\n".join(setup_info.get("messages", []))
 
-    cmd = [
-        solve_field_cmd,
-        str(image_path),
-        "--ra", str(float(ra)),
-        "--dec", str(float(dec)),
-        "--radius", str(float(fov_deg)),
-        "--overwrite",
+    # Force solve-field to write outputs under our chosen basename so we can find them.
+    out_args_for = lambda base: [
+        "--out", base,
+        "--new-fits", str(out_dir / (base + ".new.fits")),
     ]
 
-    try:
-        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=str(out_dir), timeout=timeout)
-    except subprocess.TimeoutExpired as te:
-        return {'success': False, 'stdout': te.stdout or "", 'stderr': "Timeout running solve-field", 'annotated_png': None, 'solved_fits': None, 'out_basename': str(out_basename_path)}
+    def _solve_with_args(img: Path, extra_args: list[str], pass_name: str, base: str):
+        cmd = [solve_field_cmd, str(img), "--overwrite"] + out_args_for(base) + extra_args
+        try:
+            proc = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                cwd=str(out_dir),
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as te:
+            return te.stdout or "", f"{pass_name}: Timeout running solve-field", 124
+        hdr = f"\n=== {pass_name} ===\nCMD: {' '.join(cmd)}\n"
+        out = hdr + (proc.stdout or "")
+        err = hdr + (proc.stderr or "")
+        return out, err, proc.returncode
 
-    stdout = proc.stdout or ""
-    stderr = proc.stderr or ""
+    def _find_solved_fits(base: str) -> str | None:
+        """solve-field success indicator is `<base>.solved`. The plate is `<base>.new.fits`
+        (we forced it) or `<base>.new` (default). Prefer the .new.fits file."""
+        base_path = out_dir / base
+        solved_marker = base_path.with_suffix(".solved")
+        if not solved_marker.exists():
+            return None
+        for cand in (
+            out_dir / (base + ".new.fits"),
+            out_dir / (base + ".new"),
+        ):
+            if cand.exists():
+                return str(cand)
+        # Fallback: any FITS file with our basename.
+        for f in sorted(glob.glob(str(base_path) + "*.fits")):
+            if f.endswith((".new.fits", ".axy.fits", ".corr.fits", ".rdls.fits", ".match.fits")):
+                if f.endswith(".new.fits"):
+                    return f
+                continue
+            return f
+        return None
 
-    fits_candidates = []
-    fits_candidates += glob.glob(str(out_basename_path) + "*.fits")
-    fits_candidates += [p for p in glob.glob(str(out_dir / ("*" + image_path.stem + "*.fits"))) if out_basename in p or image_path.stem in p]
-    fits_candidates = list(dict.fromkeys(fits_candidates))
+    ra_f = float(ra)
+    dec_f = float(dec)
+    fov_f = max(0.01, float(fov_deg))
+    radius_deg = max(0.5, min(15.0, fov_f * 1.2))
+    # Allow very small pixel scales for high-resolution sensors with narrow FOV.
+    scale_low = max(0.05, (fov_f * 3600.0 / 5000.0) * 0.45)
+    scale_high = min(5.0, (fov_f * 3600.0 / 500.0) * 1.65)
 
-    solved_fits = None
-    for f in fits_candidates:
-        if f.endswith(".new.fits") or f.endswith(".fits"):
-            solved_fits = f
+    passes = [
+        ("Hinted solve (tight)", [
+            "--no-plots", "--downsample", "2", "--sigma", "3", "--objs", "300",
+            "--ra", str(ra_f), "--dec", str(dec_f), "--radius", str(radius_deg),
+            "--scale-units", "arcsecperpix", "--scale-low", str(scale_low), "--scale-high", str(scale_high),
+        ]),
+        ("Hinted solve (relaxed)", [
+            "--no-plots", "--downsample", "2", "--sigma", "2", "--objs", "1000", "--cpulimit", "180",
+            "--ra", str(ra_f), "--dec", str(dec_f), "--radius", str(max(radius_deg, 5.0)),
+            "--scale-units", "arcsecperpix",
+            "--scale-low", str(max(0.05, scale_low * 0.5)),
+            "--scale-high", str(min(10.0, scale_high * 2.0)),
+        ]),
+        ("Blind solve fallback", [
+            "--no-plots", "--downsample", "2", "--sigma", "2", "--objs", "1000", "--cpulimit", "180",
+        ]),
+    ]
+    all_stdout = [f"Astrometry setup:\n{setup_log}\n"]
+    all_stderr = []
+    final_rc = 1
+    solved_fits: str | None = None
+    for pass_name, args in passes:
+        out, err, rc = _solve_with_args(image_path, args, pass_name, out_basename)
+        all_stdout.append(out)
+        all_stderr.append(err)
+        final_rc = rc
+        solved_fits = _find_solved_fits(out_basename)
+        if solved_fits:
             break
 
     annotated_candidates = []
@@ -115,20 +349,77 @@ def run_solve_field_local(image_path, ra, dec, fov_deg, out_basename, solve_fiel
 
     annotated_png = annotated_candidates[0] if annotated_candidates else None
 
+    # If FITS path does not solve, try debayered PNG next to the FITS.
+    if not solved_fits and image_path.suffix.lower() in {".fits", ".fit", ".fts"}:
+        png_candidate = image_path.with_name(image_path.stem.replace("_RAW8", "") + "_debayered.png")
+        if not png_candidate.exists():
+            alt = image_path.with_suffix("").with_name(image_path.stem + "_debayered.png")
+            png_candidate = alt if alt.exists() else png_candidate
+        if png_candidate.exists():
+            png_base = out_basename + "-png"
+            out, err, rc = _solve_with_args(
+                png_candidate,
+                ["--no-plots", "--downsample", "2", "--sigma", "2", "--objs", "1000", "--cpulimit", "180"],
+                "PNG fallback solve",
+                png_base,
+            )
+            all_stdout.append(out)
+            all_stderr.append(err)
+            final_rc = rc
+            solved_fits = _find_solved_fits(png_base)
+
+    # If still not solved, attach an index-coverage diagnostic.
+    if not solved_fits:
+        try:
+            data_dir = Path(setup_info.get("data_dir", "")) if setup_info else None
+            if data_dir and data_dir.exists():
+                installed = _installed_index_scales(data_dir)
+                wanted = set(_scales_recommended_for_fov(fov_f))
+                missing = sorted(wanted - installed)
+                if missing:
+                    ranges = dict((s, (a, b)) for s, a, b in _index_scale_ranges_arcmin())
+                    miss_lines = ", ".join(
+                        f"42{s:02d} ({ranges[s][0]:g}-{ranges[s][1]:g}')" for s in missing
+                    )
+                    inst_lines = ", ".join(f"42{s:02d}" for s in sorted(installed)) or "(none)"
+                    diag = (
+                        "\n=== Index coverage check ===\n"
+                        f"FOV {fov_f:.3f}° (~{fov_f*60:.1f}' wide). Want skymarks ~10%-100% of FOV.\n"
+                        f"Recommended index families for this FOV: {miss_lines}\n"
+                        f"Installed families in {data_dir}: {inst_lines}\n"
+                        "Solve-field exited but no `.solved` file was produced. "
+                        "This usually means too few quad matches - install the recommended "
+                        "index files and retry.\n"
+                    )
+                    all_stderr.append(diag)
+        except Exception:
+            pass
+
     return {
-        'success': (proc.returncode == 0),
-        'stdout': stdout,
-        'stderr': stderr,
+        'success': bool(solved_fits),
+        'stdout': "\n".join(all_stdout),
+        'stderr': "\n".join(all_stderr),
         'annotated_png': annotated_png,
         'solved_fits': solved_fits,
-        'out_basename': str(out_basename_path)
+        'out_basename': str(out_basename_path),
+        'setup': setup_info,
+        'return_code': final_rc,
     }
+
+
+def read_solved_fits_center_radec_deg(solved_fits_path):
+    """RA/Dec in degrees at the WCS reference (plate center) from a solved FITS."""
+    with fits.open(solved_fits_path) as hd:
+        w = WCS(hd[0].header)
+        ra, dec = w.wcs.crval[0], w.wcs.crval[1]
+    return float(ra), float(dec)
 
 
 def create_annotated_from_fits(solved_fits_path, out_png_path, max_stars=200):
     """Create an annotated PNG from a solved FITS."""
-    hd = fits.open(solved_fits_path)
-    data = hd[0].data
+    with fits.open(solved_fits_path) as hd:
+        data = hd[0].data
+        w = WCS(hd[0].header)
     if data is None:
         raise RuntimeError("Solved FITS has no image data")
     if data.ndim > 2:
@@ -156,18 +447,59 @@ def create_annotated_from_fits(solved_fits_path, out_png_path, max_stars=200):
     if pil.mode != "RGB":
         pil = pil.convert("RGB")
     draw = ImageDraw.Draw(pil)
+    font = ImageFont.load_default()
 
     if isinstance(sources, np.ndarray) and sources.size:
         if 'flux' in sources.dtype.names:
             idx_sorted = np.argsort(sources['flux'])[::-1]
         else:
             idx_sorted = np.arange(len(sources))
+        labeled_names = set()
+        star_coords = [
+            (
+                star,
+                SkyCoord(ra=float(star["ra_deg"]) * u.deg, dec=float(star["dec_deg"]) * u.deg, frame="icrs"),
+            )
+            for star in _BRIGHT_STAR_CATALOG
+        ]
         for i_idx, sidx in enumerate(idx_sorted[:max_stars]):
             sx = float(sources['x'][sidx])
             sy = float(sources['y'][sidx])
             r = 4 if i_idx < 15 else 2
             color = (0, 255, 0) if i_idx < 15 else (0, 200, 0)
             draw.ellipse([sx - r, sy - r, sx + r, sy + r], outline=color, width=2)
+
+            # Label only brightest detections to avoid unreadable clutter.
+            if i_idx >= 40:
+                continue
+            try:
+                best = None
+                best_sep_arcmin = None
+                source_coord = w.pixel_to_world(sx, sy)
+                for star, star_coord in star_coords:
+                    sep_arcmin = source_coord.separation(star_coord).arcminute
+                    if best_sep_arcmin is None or sep_arcmin < best_sep_arcmin:
+                        best = star
+                        best_sep_arcmin = sep_arcmin
+            except Exception:
+                continue
+
+            # Keep matching conservative to reduce false labels.
+            if not best or best_sep_arcmin is None or best_sep_arcmin > 8.0:
+                continue
+            star_name = best.get("name")
+            if not star_name or star_name in labeled_names:
+                continue
+            labeled_names.add(star_name)
+            distance_ly = best.get("distance_ly")
+            if distance_ly:
+                label = f"{star_name} ({distance_ly:g} ly)"
+            else:
+                label = star_name
+            tx = sx + 6
+            ty = sy - 10
+            draw.text((tx + 1, ty + 1), label, fill=(0, 0, 0), font=font)
+            draw.text((tx, ty), label, fill=(255, 255, 120), font=font)
 
     pil.save(out_png_path)
     return out_png_path
@@ -202,10 +534,49 @@ class StarDetector:
         return stars[:100]
 
 
+def default_sessions_root() -> Path:
+    return Path(__file__).resolve().parent / "sessions"
+
+
+def create_session_folder(sessions_root: Path | None = None) -> Path:
+    """Create and return a new session directory named with local date and time."""
+    root = sessions_root or default_sessions_root()
+    root.mkdir(parents=True, exist_ok=True)
+    base = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    n = 0
+    while True:
+        name = base if n == 0 else f"{base}_{n}"
+        path = root / name
+        try:
+            path.mkdir(parents=False, exist_ok=False)
+            return path
+        except FileExistsError:
+            n += 1
+
+
+def unique_dest_in_dir(dest_dir: Path, filename: str) -> Path:
+    """Return dest_dir / filename, or stem_2.ext, stem_3.ext, ... if needed."""
+    dest = dest_dir / filename
+    if not dest.exists():
+        return dest
+    stem = Path(filename).stem
+    suffix = Path(filename).suffix
+    n = 2
+    while True:
+        cand = dest_dir / f"{stem}_{n}{suffix}"
+        if not cand.exists():
+            return cand
+        n += 1
+
+
 class StarFinderGUI:
-    def __init__(self, root):
+    def __init__(self, root, session_dir: Path | None = None):
         self.root = root
-        self.root.title("Eosnyx Sky Tracker")
+        self.session_dir = Path(session_dir).resolve() if session_dir else None
+        title = "Eosnyx Sky Tracker"
+        if self.session_dir:
+            title += f" — {self.session_dir.name}"
+        self.root.title(title)
         self.root.geometry("1200x800")
         
         self.star_detector = StarDetector()
@@ -229,6 +600,16 @@ class StarFinderGUI:
         
         title_label = tk.Label(control_bar, text="SKY FINDER", font=("Segoe UI", 16, "bold"))
         title_label.pack(side=tk.LEFT, padx=6)
+
+        session_txt = (
+            f"Session: {self.session_dir.name}"
+            if self.session_dir
+            else "No session (saves next to image)"
+        )
+        self.session_info_label = tk.Label(
+            control_bar, text=session_txt, font=("Segoe UI", 9), fg=self.theme["fg_secondary"]
+        )
+        self.session_info_label.pack(side=tk.LEFT, padx=12)
         
         spacer = tk.Frame(control_bar)
         spacer.pack(side=tk.LEFT, expand=True)
@@ -382,14 +763,29 @@ class StarFinderGUI:
         filetypes = (("Image files", "*.jpg *.jpeg *.png *.bmp *.tif *.tiff *.fits *.fit"), ("All files", "*.*"))
         filename = filedialog.askopenfilename(title="Load image", filetypes=filetypes)
         if filename:
-            self.current_image_path = filename
+            src = Path(filename).resolve()
+            load_path = str(src)
+            if self.session_dir:
+                in_session = src.parent.resolve() == self.session_dir.resolve()
+                if not in_session:
+                    try:
+                        dest = unique_dest_in_dir(self.session_dir, src.name)
+                        shutil.copy2(src, dest)
+                        load_path = str(dest)
+                    except OSError as e:
+                        messagebox.showerror("Session", f"Could not copy image into session folder:\n{e}")
+                        return
+            self.current_image_path = load_path
             self.detected_stars = []
             self.solved_fits_path = None
             self.annotated_png_path = None
-            self.display_image(filename)
+            self.display_image(load_path)
             self.results_text.config(state=tk.NORMAL)
             self.results_text.delete("1.0", tk.END)
-            self.results_text.insert("1.0", f"✓ Loaded: {Path(filename).name}\n\nDetect stars or enter hints and solve.")
+            note = ""
+            if self.session_dir and Path(load_path).resolve() != src:
+                note = f"\n(copied into session from {src.name})"
+            self.results_text.insert("1.0", f"✓ Loaded: {Path(load_path).name}{note}\n\nDetect stars or enter hints and solve.")
             self.results_text.config(state=tk.DISABLED)
             self.view_annot_btn.config(state=tk.DISABLED)
             self.view_solved_btn.config(state=tk.DISABLED)
@@ -592,5 +988,19 @@ class StarFinderGUI:
 
 if __name__ == "__main__":
     root = tk.Tk()
-    app = StarFinderGUI(root)
+    root.withdraw()
+    session_path = None
+    try:
+        if messagebox.askyesno(
+            "Session",
+            "Start a new observing session?\n\n"
+            "Yes: create a folder (date and time) under the app's sessions/ directory.\n"
+            "Loaded images are copied there; plate-solve outputs stay in the same folder.\n\n"
+            "No: work without a session (solver writes next to the image you load).",
+        ):
+            session_path = create_session_folder()
+    except OSError as e:
+        messagebox.showerror("Session", f"Could not create session folder:\n{e}")
+    root.deiconify()
+    app = StarFinderGUI(root, session_dir=session_path)
     root.mainloop()

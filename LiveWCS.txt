@@ -1,0 +1,7 @@
+{
+  "object": "Miaplacidus",
+  "ra_WCS": "09h 13m 29.19s",
+  "dec_WCS": "-69deg 49' 48.5",
+  "ra_deg": 138.371633,
+  "dec_deg": -69.830128
+}
