@@ -21,4 +21,16 @@ if [[ ! -x "${VENV_PYTHON}" ]]; then
   exit 1
 fi
 
+# sky_ephemeris.py expects updatedTycho2.parquet (lowercase u).
+# Keep launch robust when only UpdatedTycho2.parquet is present.
+if [[ -f "${SCRIPT_DIR}/UpdatedTycho2.parquet" && ! -f "${SCRIPT_DIR}/updatedTycho2.parquet" ]]; then
+  cp "${SCRIPT_DIR}/UpdatedTycho2.parquet" "${SCRIPT_DIR}/updatedTycho2.parquet"
+fi
+
+if [[ ! -f "${SCRIPT_DIR}/updatedTycho2.parquet" ]]; then
+  printf "[ASTRA][ERROR] Missing updatedTycho2.parquet (or UpdatedTycho2.parquet).\n" >&2
+  printf "[ASTRA][ERROR] Run ./install_and_run_linux.sh or copy the catalog into project root.\n" >&2
+  exit 1
+fi
+
 exec "${VENV_PYTHON}" "${SCRIPT_DIR}/astra_main.py"
