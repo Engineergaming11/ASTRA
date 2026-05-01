@@ -14,6 +14,8 @@ import numpy as np
 import pandas as pd
 from skyfield.api import Loader, Star, load, load_file, wgs84
 
+from offline_star_facts import OFFLINE_STAR_FACTS
+
 _BASE = Path(__file__).resolve().parent
 
 # Default site (University of Arizona Steward) — used when no GPS/session site.
@@ -23,6 +25,13 @@ DEFAULT_ELEV_M = 728.0
 
 catalog = pd.read_parquet(_BASE / "updatedTycho2.parquet")
 messier_catalog = pd.read_parquet(_BASE / "Messier_Updated.parquet")
+
+# Lazy-built unit vectors for fast nearest Tycho match (plate-solve annotations).
+_TYC_ANN_U32: Optional[np.ndarray] = None
+_TYC_ANN_TYC: Optional[np.ndarray] = None
+_TYC_ANN_VT: Optional[np.ndarray] = None
+_TYC_ANN_BT: Optional[np.ndarray] = None
+
 ts = load.timescale()
 _eph_path = _BASE / "de440.bsp"
 # `load(full_path)` is not supported — Skyfield treats it as a basename and builds a bad URL.
@@ -32,12 +41,48 @@ else:
     eph = Loader(str(_BASE))("de440.bsp")
 
 TYCHO_PRESET_STARS = {
+    "Achernar": "8478 01395 1",
+    "Acrux": "8979 03464 1",
+    "Adhara": "6535 03619 1",
+    "Aldebaran": "1266 01416 1",
+    "Alnair": "8438 01959 1",
+    "Alnilam": "4766 02450 1",
+    "Alnitak": "4771 01188 1",
+    "Alioth": "3845 01190 1",
+    "Altair": "1058 03399 1",
+    "Alkaid": "3467 01257 1",
+    "Alphard": "5460 01592 1",
+    "Antares": "6803 02158 1",
+    "Arcturus": "1472 01436 2",
     "Avior": "8579 02692 1",
+    "Bellatrix": "0113 01856 1",
+    "Betelgeuse": "0129 01873 1",
+    "Canopus": "8534 02277 1",
+    "Capella": "3358 03141 1",
+    "Castor": "2457 02407 1",
+    "Deneb": "3574 03347 1",
+    "Elnath": "1859 01470 1",
+    "Fomalhaut": "6977 01267 1",
+    "Gacrux": "8654 03422 1",
+    "Hadar": "9005 03919 1",
     "Miaplacidus": "9200 02603 1",
+    "Pollux": "1920 02194 1",
+    "Procyon": "0187 02184 1",
     "Regulus": "0833 01381 1",
     "Rigel": "5331 01752 1",
-    "Alioth": "3845 01190 1",
-    "Alkaid": "3467 01257 1",
+    "Shaula": "7388 01093 1",
+    "Sirius": "5949 02777 1",
+    "Spica": "5547 01518 1",
+    "Vega": "3105 02070 1",
+}
+
+
+def _norm_tyc_id(tid: object) -> str:
+    return " ".join(str(tid).strip().split())
+
+
+TYCHO_NAME_BY_ID: Dict[str, str] = {
+    _norm_tyc_id(tid): name for name, tid in TYCHO_PRESET_STARS.items()
 }
 
 SOLAR_SYSTEM_BODIES = {
@@ -55,12 +100,39 @@ SOLAR_SYSTEM_BODIES = {
 NEBULAE: Dict[str, str] = {}
 
 DESCRIPTIONS: Dict[str, str] = {
+    "Achernar": "Achernar (Alpha Eridani) is a hot, rapidly rotating star at the mouth of Eridanus.",
+    "Acrux": "Acrux (Alpha Crucis) is the brightest star in the Southern Cross.",
+    "Adhara": "Adhara (Epsilon Canis Majoris) is a brilliant blue supergiant in Canis Major.",
+    "Aldebaran": "Aldebaran (Alpha Tauri) is an orange giant marking the eye of Taurus.",
+    "Alkaid": "Alkaid (Eta Ursae Majoris) forms the end of the Big Dipper's handle.",
+    "Alnair": "Alnair (Alpha Gruis) is the brightest star in Grus.",
+    "Alnilam": "Alnilam (Epsilon Orionis) is the central star in Orion's Belt.",
+    "Alnitak": "Alnitak (Zeta Orionis) is the eastern belt star in Orion.",
+    "Alioth": "Alioth (Epsilon Ursae Majoris) is the brightest star in Ursa Major.",
+    "Altair": "Altair (Alpha Aquilae) is a rapid rotator and one of the Summer Triangle vertices.",
+    "Alphard": "Alphard (Alpha Hydrae) is an orange giant in the long constellation Hydra.",
+    "Antares": "Antares (Alpha Scorpii) is a red supergiant paired with a hot companion.",
+    "Arcturus": "Arcturus (Alpha Bootis) is a nearby orange giant and a navigation landmark.",
     "Avior": "Avior (Epsilon Carinae) is a binary star system in the constellation Carina.",
+    "Bellatrix": "Bellatrix (Gamma Orionis) is a hot B giant in Orion's shoulder.",
+    "Betelgeuse": "Betelgeuse (Alpha Orionis) is a red supergiant nearing the end of its life.",
+    "Canopus": "Canopus (Alpha Carinae) is the second-brightest night-sky star after Sirius.",
+    "Capella": "Capella (Alpha Aurigae) is a bright quadruple star in Auriga.",
+    "Castor": "Castor (Alpha Geminorum) is a famous multiple-star system in Gemini.",
+    "Deneb": "Deneb (Alpha Cygni) is a luminous supergiant at the tail of Cygnus.",
+    "Elnath": "Elnath (Beta Tauri) is a B giant on the border of Taurus and Auriga.",
+    "Fomalhaut": "Fomalhaut (Alpha Piscis Austrini) has a well-known debris disk.",
+    "Gacrux": "Gacrux (Gamma Crucis) is a red giant at the top of the Southern Cross.",
+    "Hadar": "Hadar (Beta Centauri) is a binary system and one of the brightest stars in the sky.",
     "Miaplacidus": "Miaplacidus (Beta Carinae) is the second-brightest star in Carina.",
+    "Pollux": "Pollux (Beta Geminorum) is an orange giant with a known exoplanet.",
+    "Procyon": "Procyon (Alpha Canis Minoris) is a nearby binary with a white dwarf.",
     "Regulus": "Regulus (Alpha Leonis) is the brightest star in Leo.",
     "Rigel": "Rigel (Beta Orionis) is a blue supergiant star in Orion.",
-    "Alioth": "Alioth (Epsilon Ursae Majoris) is the brightest star in Ursa Major.",
-    "Alkaid": "Alkaid (Eta Ursae Majoris) forms the end of the Big Dipper's handle.",
+    "Shaula": "Shaula (Lambda Scorpii) is a hot binary in the tail of Scorpius.",
+    "Sirius": "Sirius (Alpha Canis Majoris) is the brightest star in the night sky.",
+    "Spica": "Spica (Alpha Virginis) is a massive close binary in Virgo.",
+    "Vega": "Vega (Alpha Lyrae) is a bright A star and a calibration anchor for photometry.",
     "Sun": "The Sun is the star at the center of our Solar System.",
     "Moon": "Earth's Moon is the brightest object in our night sky after the Sun.",
     "Mercury": "Mercury is the smallest planet and closest to the Sun.",
@@ -77,6 +149,87 @@ DESCRIPTIONS: Dict[str, str] = {
     "Dumbbell Nebula": "M27, the Dumbbell Nebula, is a planetary nebula in Vulpecula.",
     "Helix Nebula": "NGC 7293, the Helix Nebula, is one of the closest planetary nebulae.",
 }
+
+
+def _ensure_tycho_ann_index() -> None:
+    """Build float32 unit-sphere vectors for Tycho rows with valid coordinates (lazy, once)."""
+    global _TYC_ANN_U32, _TYC_ANN_TYC, _TYC_ANN_VT, _TYC_ANN_BT
+    if _TYC_ANN_U32 is not None:
+        return
+    ra_deg = catalog["RA_deg"].to_numpy(dtype=np.float64, copy=False)
+    dec_deg = catalog["Dec_deg"].to_numpy(dtype=np.float64, copy=False)
+    ok = np.isfinite(ra_deg) & np.isfinite(dec_deg)
+    ra_deg = ra_deg[ok]
+    dec_deg = dec_deg[ok]
+    _TYC_ANN_TYC = catalog["TYC_ID"].to_numpy(dtype=object)[ok]
+    _TYC_ANN_VT = catalog["VT_mag"].to_numpy(dtype=np.float64, copy=False)[ok]
+    _TYC_ANN_BT = catalog["BT_mag"].to_numpy(dtype=np.float64, copy=False)[ok]
+    ra = np.radians(ra_deg)
+    dec = np.radians(dec_deg)
+    cd = np.cos(dec)
+    u = np.stack((cd * np.cos(ra), cd * np.sin(ra), np.sin(dec)), axis=1).astype(np.float32, copy=False)
+    norms = np.linalg.norm(u, axis=1, keepdims=True)
+    norms = np.where(norms > 0, norms, 1.0)
+    _TYC_ANN_U32 = (u / norms).astype(np.float32, copy=False)
+
+
+def tycho_nearest_identification(
+    ra_deg: float,
+    dec_deg: float,
+    *,
+    max_sep_deg: float = 0.11,
+) -> Optional[Tuple[str, str, str]]:
+    """
+    Nearest Tycho-2 catalog entry to (RA, Dec) in degrees (J2000-like catalog frame).
+
+    Returns (display_name, fact, catalog_source) or None if no star within ``max_sep_deg``.
+    Tight default separation avoids spurious IDs where the bundled Tycho subset is sparse
+    (e.g. near the celestial poles).
+    """
+    _ensure_tycho_ann_index()
+    assert _TYC_ANN_U32 is not None and _TYC_ANN_TYC is not None
+    r1 = np.radians(float(ra_deg))
+    d1 = np.radians(float(dec_deg))
+    cd1 = np.cos(d1)
+    q = np.array([cd1 * np.cos(r1), cd1 * np.sin(r1), np.sin(d1)], dtype=np.float32)
+    qn = float(np.linalg.norm(q))
+    if qn <= 0:
+        return None
+    q /= qn
+    cosv = (_TYC_ANN_U32 @ q).astype(np.float64, copy=False)
+    cosv = np.clip(cosv, -1.0, 1.0)
+    sep_rad = np.arccos(cosv)
+    sep_deg = np.degrees(sep_rad)
+    j = int(np.argmin(sep_deg))
+    best_sep = float(sep_deg[j])
+    if best_sep > float(max_sep_deg) or not np.isfinite(best_sep):
+        return None
+    tid_key = _norm_tyc_id(_TYC_ANN_TYC[j])
+    preset_name = TYCHO_NAME_BY_ID.get(tid_key)
+    vt = float(_TYC_ANN_VT[j])
+    bt = float(_TYC_ANN_BT[j])
+    mag_bits: List[str] = []
+    if np.isfinite(vt) and 0.0 < vt < 25.0:
+        mag_bits.append(f"V_T ≈ {vt:.2f}")
+    if np.isfinite(bt) and 0.0 < bt < 25.0:
+        mag_bits.append(f"B_T ≈ {bt:.2f}")
+    mag_txt = ", ".join(mag_bits) if mag_bits else "Tycho magnitude fields unavailable for this row"
+
+    if preset_name:
+        display = preset_name
+        fact = DESCRIPTIONS.get(
+            preset_name,
+            f"{preset_name} is a Tycho-2 reference star in ASTRA ({mag_txt}).",
+        )
+        src = "Tycho-2 (named preset)"
+    else:
+        display = f"TYC {tid_key.replace(' ', '-')}"
+        fact = (
+            f"Nearest Tycho-2 catalog star to the detection ({mag_txt}). "
+            f"Great-circle separation ≈ {best_sep * 3600.0:.0f} arcsec."
+        )
+        src = "Tycho-2"
+    return display, fact, src
 
 
 def load_messier_objects() -> None:
@@ -274,7 +427,8 @@ def polar_align_mvp_text(
     ast_pole = obs.at(t).observe(pole).apparent()
     alt_p, az_p, _ = ast_pole.altaz()
 
-    polaris = eph["Polaris"]
+    # Polaris is a fixed star, not a SPICE solar-system body key.
+    polaris = Star(ra_hours=37.95456067 / 15.0, dec_degrees=89.26410897)
     ast_pol = obs.at(t).observe(polaris).apparent()
     alt_pol, az_pol, _ = ast_pol.altaz()
 

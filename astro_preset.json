@@ -1,0 +1,19 @@
+{
+  "name": "Tucson SCT 2032mm",
+  "site": {
+    "label": "Tucson, AZ",
+    "lat": 32.2329,
+    "lon": -110.9479,
+    "elev_m": 728.0
+  },
+  "telescope": {
+    "label": "8\" Schmidt-Cassegrain",
+    "focal_length_mm": 2032.0
+  },
+  "camera": {
+    "label": "ZWO ASI585MC",
+    "pixel_size_um": 2.9,
+    "sensor_w_px": 3840,
+    "sensor_h_px": 2160
+  }
+}

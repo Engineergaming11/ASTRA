@@ -43,10 +43,11 @@ bash ./install_and_run.sh --check-only
 
 | Program | Purpose |
 |--------|---------|
-| `astra_main.py` | Main app: camera preview/capture, Mount tab, Site / Sky tools, Plate solve tab. |
+| `astra_main.py` | Main app: camera preview/capture, Mount tab, Site / Sky tools, Deep Sky stacking, Plate solve tab. |
 | `SkyTracker2.py` | Optional companion target picker; writes `LiveWCS.txt` used by main GUI. |
 | `Formal_PlateSolve_GUI.py` | Standalone plate solve UI. |
 | `EQMountControls.py` | Standalone mount control window. |
+| `deep_sky_stacker.py` | Offline stacking pipeline used by the **Deep Sky** tab (importable on its own). |
 
 Run from the project root so paths resolve correctly.
 
@@ -73,6 +74,37 @@ Run from the project root so paths resolve correctly.
 4. Plate solve a FITS image in `Plate solve`.
 5. Connect mount in `Mount` tab (serial or Wi-Fi), then slew/track.
 6. Optional: run `python3 SkyTracker2.py` in a second terminal for live target feed.
+
+## Deep Sky stacking (offline)
+
+The **Deep Sky** tab in the main GUI lets you combine multiple captured FITS frames into a single calibrated, stretched image — fully offline, no internet or cloud calls.
+
+Workflow:
+
+1. Capture lights with `Frame Type = Light` so they land in `~/ASICAP/CapGUI/<project>/Light/`. Optionally also capture `Dark`, `Flat`, `Bias` frames in the same project.
+2. Open the **Deep Sky** tab.
+3. For each frame kind, click **Add files…** or **Add folder…**. Defaults point to the matching subfolder under your active project.
+4. Tune settings if needed:
+   - **Combine**: `mean`, `median`, or `sigma_clip` (default — outlier-rejected mean).
+   - **σ low / σ high**: rejection thresholds when using sigma-clip.
+   - **Reference**: `auto (most stars)` picks the best frame; `first frame` forces frame 1.
+   - **Bayer**: `auto` reads `BAYERPAT` from the FITS header. Select `mono` to skip debayering, or pick an explicit pattern.
+   - **Stretch**: `asinh` (default — emphasizes faint nebulosity), `zscale`, `percentile`, or `linear` for the preview PNG.
+5. Click **Stack**. Progress and per-frame status appear in the log; a stretched preview is shown when finished.
+6. Use **Use stacked FITS in plate solve** to immediately load the result into the Plate solve tab, or **Open output folder** / **Save preview as…**.
+
+Outputs land in `<save_path>/<project>/Stacks/<timestamp>/`:
+
+- `stack_<timestamp>.fits` — 32-bit float stacked FITS (color is stored channel-first as `(3, H, W)`).
+- `stack_<timestamp>_preview.png` — 8-bit stretched preview suitable for sharing.
+
+What each calibration frame does:
+
+- **Bias** — sensor read noise floor. Subtracted from lights and from flats.
+- **Dark** — thermal + bias signal at the same exposure/temperature. Subtracted from lights.
+- **Flat** — vignetting / dust pattern at uniform illumination. Lights are divided by the (bias-subtracted, normalized) master flat.
+
+Offline guarantee: the stacker (`deep_sky_stacker.py`) makes no HTTP, FTP, or socket calls. It uses `numpy`, `opencv-python`, `astropy`, `sep`, `scipy`, and `astroalign` — all pure-Python or wheel-distributed and operate on local arrays only. Stacked FITS files can be fed directly into the offline `solve-field`-based plate solve tab.
 
 ## Validation checks
 
@@ -108,3 +140,5 @@ python astra_main.py
 - Plate solve path errors on macOS: ASTRA now auto-creates `~/astrometry/data` and repoints Homebrew `astrometry.cfg` away from stale versioned Cellar paths.
 - Hard solve cases: ASTRA plate solve now runs multi-pass (hinted -> relaxed -> blind) and falls back to nearby debayered PNG files when FITS does not solve cleanly.
 - Sky tracker blank: run `SkyTracker2.py` from this same project directory.
+- Deep Sky tab logs `astroalign unavailable`: run `pip install astroalign` (or re-run `install_and_run.sh`). Stacking still works in this state via a translation-only centroid fallback, but is less robust to field rotation.
+- Deep Sky stack is mostly black: try a different stretch (`asinh` -> `zscale`), or make sure your master flat is not nearly zero in some pixels (the pipeline clamps tiny flat values but a badly exposed flat will still over-darken).

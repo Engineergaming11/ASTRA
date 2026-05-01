@@ -83,7 +83,7 @@ fi
 log "Validating required Python imports"
 python - <<'PY'
 import importlib
-mods = ["customtkinter", "numpy", "cv2", "PIL", "pandas", "pyarrow", "astropy", "skyfield", "serial", "sep", "scipy", "zwoasi"]
+mods = ["customtkinter", "numpy", "cv2", "PIL", "pandas", "pyarrow", "astropy", "skyfield", "serial", "sep", "scipy", "matplotlib", "zwoasi"]
 failed = []
 for m in mods:
     try:

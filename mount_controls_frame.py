@@ -176,16 +176,21 @@ class MountControlsFrame(ctk.CTkFrame):
         content.pack(fill="both", expand=True)
         content.columnconfigure(0, weight=1)
         content.columnconfigure(1, weight=1)
-        content.rowconfigure(0, weight=1)
+        # Controls keep natural height; activity log row absorbs vertical space.
+        content.rowconfigure(0, weight=0)
+        content.rowconfigure(1, weight=1)
 
         left = ctk.CTkFrame(content, fg_color="transparent")
-        left.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 8), pady=(0, 8))
         right = ctk.CTkFrame(content, fg_color="transparent")
-        right.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
+        right.grid(row=0, column=1, sticky="nsew", padx=(8, 0), pady=(0, 8))
+
+        log_row = ctk.CTkFrame(content, fg_color="transparent")
+        log_row.grid(row=1, column=0, columnspan=2, sticky="nsew")
 
         self._build_position_panel(left)
         self._build_nudge_panel(right)
-        self._build_log_panel(right)
+        self._build_log_panel(log_row)
 
     def _build_auto_tracking_tab(self, parent):
         content = ctk.CTkFrame(parent, fg_color="transparent")
@@ -780,7 +785,7 @@ class MountControlsFrame(ctk.CTkFrame):
     def _build_log_panel(self, parent):
         panel = self._panel(parent, "ACTIVITY LOG", expand=True)
         self._log_box = ctk.CTkTextbox(
-            panel, height=120,
+            panel,
             fg_color=self._pal["entry_bg"], text_color=self._pal["text"],
             font=ctk.CTkFont(family="Courier New", size=11),
             border_color=self._pal["border"], border_width=1,

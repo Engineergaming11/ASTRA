@@ -301,31 +301,35 @@ def run_solve_field_local(image_path, ra, dec, fov_deg, out_basename, solve_fiel
             return f
         return None
 
-    ra_f = float(ra)
-    dec_f = float(dec)
+    ra_f = float(ra) if ra is not None else None
+    dec_f = float(dec) if dec is not None else None
     fov_f = max(0.01, float(fov_deg))
     radius_deg = max(0.5, min(15.0, fov_f * 1.2))
     # Allow very small pixel scales for high-resolution sensors with narrow FOV.
     scale_low = max(0.05, (fov_f * 3600.0 / 5000.0) * 0.45)
     scale_high = min(5.0, (fov_f * 3600.0 / 500.0) * 1.65)
 
-    passes = [
-        ("Hinted solve (tight)", [
-            "--no-plots", "--downsample", "2", "--sigma", "3", "--objs", "300",
-            "--ra", str(ra_f), "--dec", str(dec_f), "--radius", str(radius_deg),
-            "--scale-units", "arcsecperpix", "--scale-low", str(scale_low), "--scale-high", str(scale_high),
-        ]),
-        ("Hinted solve (relaxed)", [
-            "--no-plots", "--downsample", "2", "--sigma", "2", "--objs", "1000", "--cpulimit", "180",
-            "--ra", str(ra_f), "--dec", str(dec_f), "--radius", str(max(radius_deg, 5.0)),
-            "--scale-units", "arcsecperpix",
-            "--scale-low", str(max(0.05, scale_low * 0.5)),
-            "--scale-high", str(min(10.0, scale_high * 2.0)),
-        ]),
+    passes = []
+    if ra_f is not None and dec_f is not None:
+        passes.extend([
+            ("Hinted solve (tight)", [
+                "--no-plots", "--downsample", "2", "--sigma", "3", "--objs", "300",
+                "--ra", str(ra_f), "--dec", str(dec_f), "--radius", str(radius_deg),
+                "--scale-units", "arcsecperpix", "--scale-low", str(scale_low), "--scale-high", str(scale_high),
+            ]),
+            ("Hinted solve (relaxed)", [
+                "--no-plots", "--downsample", "2", "--sigma", "2", "--objs", "1000", "--cpulimit", "180",
+                "--ra", str(ra_f), "--dec", str(dec_f), "--radius", str(max(radius_deg, 5.0)),
+                "--scale-units", "arcsecperpix",
+                "--scale-low", str(max(0.05, scale_low * 0.5)),
+                "--scale-high", str(min(10.0, scale_high * 2.0)),
+            ]),
+        ])
+    passes.append(
         ("Blind solve fallback", [
             "--no-plots", "--downsample", "2", "--sigma", "2", "--objs", "1000", "--cpulimit", "180",
-        ]),
-    ]
+        ])
+    )
     all_stdout = [f"Astrometry setup:\n{setup_log}\n"]
     all_stderr = []
     final_rc = 1

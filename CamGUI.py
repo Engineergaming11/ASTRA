@@ -10,11 +10,25 @@ import os
 import sys
 import json
 import time
+import math
 from datetime import datetime, time as dt_time
 from pathlib import Path
 from urllib.request import urlopen
+try:
+    import matplotlib.pyplot as plt  # pyright: ignore[reportMissingImports]
+    import matplotlib.patches as mpatches  # pyright: ignore[reportMissingImports]
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg  # pyright: ignore[reportMissingImports]
+    from matplotlib.backends.backend_pdf import PdfPages  # pyright: ignore[reportMissingImports]
+    _HAS_MATPLOTLIB = True
+except Exception:
+    plt = None
+    mpatches = None
+    FigureCanvasTkAgg = None
+    PdfPages = None
+    _HAS_MATPLOTLIB = False
 
 from astropy.io import fits
+from astropy.wcs import WCS
 import sep
 
 from Formal_PlateSolve_GUI import (
@@ -29,12 +43,14 @@ from sky_ephemeris import (
     DEFAULT_ELEV_M,
     DEFAULT_LAT,
     DEFAULT_LON,
+    OFFLINE_STAR_FACTS,
     SOLAR_SYSTEM_BODIES,
     TYCHO_PRESET_STARS,
     major_bodies_separation_table,
     polar_align_mvp_text,
     radec_to_altaz_deg,
     sun_apparent_radec_deg,
+    tycho_nearest_identification,
 )
 from ioptron_mount import (
     TRACK_LUNAR,
@@ -46,6 +62,8 @@ from ioptron_mount import (
     _parse_ra_input,
 )
 from location_gps import try_read_lat_lon_nmea
+
+import deep_sky_stacker
 
 
 def _default_capture_save_path() -> str:
@@ -148,14 +166,23 @@ DEFAULT_ASTRO_PRESET = {
     },
     "camera": {
         # Will be auto-filled from the connected ZWO camera the first time
-        # the user clicks "Auto-fill from camera". These fallbacks roughly
-        # match a typical 1.25" small-pixel astro camera.
-        "label": "ZWO (auto)",
-        "pixel_size_um": 3.76,
-        "sensor_w_px": 1936,
-        "sensor_h_px": 1096,
+        # the user clicks "Auto-fill from camera". These defaults match
+        # ZWO ASI585MC sensor specs.
+        "label": "ZWO ASI585MC",
+        "pixel_size_um": 2.9,
+        "sensor_w_px": 3840,
+        "sensor_h_px": 2160,
     },
 }
+
+# Plate-solve equipment tab: quick telescope choices (focal length drives FOV hints).
+PLATE_SOLVE_TELESCOPE_MENU_LABELS = (
+    '8" SCT @ 2032 mm',
+    '4" refractor @ 660 mm',
+    "Different telescope",
+)
+PLATE_SOLVE_REFRACTOR_4IN_LABEL = '4" Refractor'
+PLATE_SOLVE_REFRACTOR_4IN_FOCAL_MM = 660.0
 
 
 def _compute_plate_scale_arcsec_per_px(pixel_size_um: float, focal_length_mm: float) -> float:
@@ -263,6 +290,17 @@ SETUP_TARGET_BRIGHT_STARS = "Main bright stars in Tucson"
 SETUP_TARGET_MOON = "Moon"
 SETUP_TARGET_CONSTELLATIONS = "Constellations"
 
+# Offline bright-star facts: see ``offline_star_facts.OFFLINE_STAR_FACTS`` (re-exported from sky_ephemeris).
+
+# Offline lunar region fact catalog for plate-solved Moon frames.
+OFFLINE_MOON_REGION_FACTS = {
+    "near_side_center": "The near-side maria are ancient lava plains formed by huge impacts and later basalt floods.",
+    "north_limb": "The Moon's north-limb highlands are heavily cratered, preserving very old crust.",
+    "south_limb": "The south-limb region transitions toward the South Pole-Aitken basin, one of the Solar System's largest impact basins.",
+    "east_limb": "The eastern limb often reveals foreshortened crater walls and shifting detail with libration.",
+    "west_limb": "The western limb frequently highlights rugged terrain and crater chains near the lunar edge.",
+}
+
 
 class ZWOCameraGUI:
     def __init__(self, root):
@@ -297,6 +335,14 @@ class ZWOCameraGUI:
         self.site_elev_m = DEFAULT_ELEV_M
         self.wedge_acknowledged = False
         self.mount_panel = None
+        self._polar_align_mode = False
+        self._polar_align_panel = None
+        self._polar_align_text = None
+        self._polar_align_fig = None
+        self._polar_align_ax = None
+        self._polar_align_canvas = None
+        self._polar_align_fov_deg = 5.0
+        self._polar_align_history: list[tuple[float, float]] = []
         self._last_solve_ra_deg = None
         self._last_solve_dec_deg = None
         self._last_plate_solve_input_path = None
@@ -305,6 +351,29 @@ class ZWOCameraGUI:
         self._sun_crosshair_thickness = 2
         # In-app session captures for Session photos tab (fits_path, captured_at iso, ra/dec if solved)
         self._session_photos = []
+        # Focus assistant state (camera-side Focus tab). Samples are dicts with
+        # keys: index, position, score (higher better), kind ("hfr"/"laplacian"),
+        # raw (HFR px or Laplacian variance), n_stars, captured_at.
+        self._focus_samples: list[dict] = []
+        self._focus_run_busy = False
+        self._latest_preview_full_rgb: np.ndarray | None = None
+        self._latest_preview_full_ts: float = 0.0
+        self._focus_fig = None
+        self._focus_ax = None
+        self._focus_canvas = None
+        # Deep Sky stacking tab state. Lights/darks/flats/bias are absolute paths.
+        self._dsk_lights: list[str] = []
+        self._dsk_darks: list[str] = []
+        self._dsk_flats: list[str] = []
+        self._dsk_bias: list[str] = []
+        self._dsk_cancel = threading.Event()
+        self._dsk_thread: threading.Thread | None = None
+        self._dsk_last_result = None
+        self._dsk_preview_imgtk: ImageTk.PhotoImage | None = None
+        self._dsk_count_lights_var = None
+        self._dsk_count_darks_var = None
+        self._dsk_count_flats_var = None
+        self._dsk_count_bias_var = None
         # Equipment preset (Tucson, AZ + 2032 mm SCT). Loaded from disk if present;
         # otherwise the bundled default is used and persisted on next save.
         self.astro_preset = json.loads(json.dumps(DEFAULT_ASTRO_PRESET))  # deep-ish copy
@@ -320,13 +389,6 @@ class ZWOCameraGUI:
         self._livewcs_last_mtime = None
         self._livewcs_poll_running = False
         self._livewcs_active = False
-
-        # Focus-assist wizard (quarter-turn sweep)
-        self._focus_cancel = threading.Event()
-        self._focus_generation = 0
-        self._focus_saved_camera = None
-        self._focus_scores = []
-        self._focus_sweep_metric_mode = None
 
         # Busy indicator state (set up by setup_ui). _busy_count supports nested
         # async operations so the spinner only hides when everything is done.
@@ -854,103 +916,6 @@ class ZWOCameraGUI:
             raise RuntimeError("Camera capture returned no frame")
         return frame
 
-    def _clamp_gain_for_camera(self, gain: int) -> int:
-        if not self.camera or not self.camera_initialized:
-            return gain
-        try:
-            ctrl = self.camera.get_controls().get("Gain") or self.camera.get_controls().get("ASI_GAIN")
-            if ctrl:
-                lo = int(ctrl.get("MinValue", 0))
-                hi = int(ctrl.get("MaxValue", 600))
-                return max(lo, min(hi, int(gain)))
-        except Exception:
-            pass
-        return max(0, min(600, int(gain)))
-
-    def _frame_to_luminance_u8(self, frame: np.ndarray, image_format: str) -> np.ndarray:
-        if len(frame.shape) == 3 and frame.shape[2] >= 3:
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            return cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
-
-        frame_2d = frame if len(frame.shape) == 2 else frame.reshape(frame.shape[0], frame.shape[1])
-        if image_format == "RAW16":
-            g8 = (frame_2d / 256.0).clip(0, 255).astype(np.uint8)
-        else:
-            g8 = np.clip(frame_2d, 0, 255).astype(np.uint8)
-        rgb = cv2.cvtColor(g8, cv2.COLOR_BayerRG2RGB)
-        return cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
-
-    def _prep_focus_gray(self, frame: np.ndarray, image_format: str) -> np.ndarray:
-        gray = self._frame_to_luminance_u8(frame, image_format)
-        h, w = gray.shape[:2]
-        if max(h, w) > 2048:
-            scale = 2048 / max(h, w)
-            gray = cv2.resize(gray, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
-        return gray
-
-    def _focus_sep_quality_from_gray(self, gray: np.ndarray):
-        arr = gray.astype(np.float32)
-        try:
-            bkg = sep.Background(arr)
-            sub = arr - bkg.back()
-            thresh = 2.5 * float(np.std(sub)) + 1e-6
-            sources = sep.extract(sub, thresh)
-        except Exception:
-            return None
-
-        min_stars = 5
-        if sources is None or len(sources) < min_stars:
-            return None
-        if "flux" in sources.dtype.names:
-            order = np.argsort(sources["flux"])[::-1]
-        else:
-            order = np.arange(len(sources))
-        take = min(40, len(order))
-        sizes = []
-        for i in range(take):
-            sidx = int(order[i])
-            a = float(sources["a"][sidx])
-            b = float(sources["b"][sidx])
-            if a <= 0 or b <= 0:
-                continue
-            fwhm = 2.355 * 0.5 * (a + b)
-            sizes.append(fwhm)
-        if len(sizes) < min_stars:
-            return None
-        med = float(np.median(np.array(sizes)))
-        return (-med, f"SEP median FWHM~px {med:.2f} (lower is sharper)")
-
-    def _focus_laplacian_quality_from_gray(self, gray: np.ndarray) -> tuple[float, str]:
-        lap = cv2.Laplacian(gray, cv2.CV_64F)
-        v = float(lap.var())
-        return (v, f"Laplacian variance {v:.1f}")
-
-    def _focus_quality_from_frame(self, frame: np.ndarray, image_format: str) -> tuple[float, str]:
-        """Return (quality_higher_is_better, description)."""
-        gray = self._prep_focus_gray(frame, image_format)
-        sep_q = self._focus_sep_quality_from_gray(gray)
-        if sep_q is not None:
-            return sep_q
-        return self._focus_laplacian_quality_from_gray(gray)
-
-    def _focus_quality_for_sweep_step(self, frame: np.ndarray, image_format: str) -> tuple[float, str]:
-        """One metric family for the whole sweep (plan: lock score type per run)."""
-        gray = self._prep_focus_gray(frame, image_format)
-        if self._focus_sweep_metric_mode is None:
-            sep_q = self._focus_sep_quality_from_gray(gray)
-            if sep_q is not None:
-                self._focus_sweep_metric_mode = "sep"
-                return sep_q
-            self._focus_sweep_metric_mode = "lap"
-            return self._focus_laplacian_quality_from_gray(gray)
-        if self._focus_sweep_metric_mode == "sep":
-            sep_q = self._focus_sep_quality_from_gray(gray)
-            if sep_q is not None:
-                return sep_q
-            lq, ld = self._focus_laplacian_quality_from_gray(gray)
-            return (lq, f"{ld} (SEP unavailable this step)")
-        return self._focus_laplacian_quality_from_gray(gray)
-
     def setup_ui(self):
         style = ttk.Style()
         style.theme_use('clam')
@@ -1009,6 +974,19 @@ class ZWOCameraGUI:
             corner_radius=6
         )
         self.theme_btn.pack(side=tk.RIGHT)
+        self.polar_align_mode_btn = ctk.CTkButton(
+            self.top_bar,
+            text="Polar Align Mode",
+            command=self._toggle_polar_align_mode,
+            font=("Segoe UI", 9, "bold"),
+            width=150,
+            height=32,
+            fg_color="#7a0c0c",
+            text_color="#ffe6e6",
+            hover_color="#d11515",
+            corner_radius=6,
+        )
+        self.polar_align_mode_btn.pack(side=tk.RIGHT, padx=(0, 8))
 
         # MAIN CONTAINER — horizontal splitters so camera / center / mount can be resized (~1/3–2/3)
         self.main = tk.Frame(self.root)
@@ -1112,7 +1090,6 @@ class ZWOCameraGUI:
         )
         self._camera_tabs.pack(fill=tk.BOTH, expand=True, pady=(4, 0))
         self._camera_tabs.add("Camera")
-        self._camera_tabs.add("Focusing")
         camera_parent = self._camera_tabs.tab("Camera")
 
         # Helper function to create dropdown controls
@@ -1321,16 +1298,15 @@ class ZWOCameraGUI:
                 corner_radius=6
             )
 
-        self.start_preview_btn = create_action_button("Start Preview", self.toggle_preview)
-        self.start_preview_btn.pack(fill=tk.X, pady=4)
-
         self.capture_img_btn = create_action_button("Capture Image", self.capture_image)
         self.capture_img_btn.pack(fill=tk.X, pady=4)
 
         self.record_video_btn = create_action_button("Start Recording", self.toggle_recording)
         self.record_video_btn.pack(fill=tk.X, pady=4)
 
-        self._build_focusing_tab(self._camera_tabs.tab("Focusing"))
+        # FOCUS ASSISTANT TAB — sibling of "Camera"
+        self._camera_tabs.add("Focus")
+        self._build_focus_tab(self._camera_tabs.tab("Focus"))
 
         # SKY TRACKER SECTION
         ttk.Separator(self.left).pack(fill=tk.X, pady=10)
@@ -1422,431 +1398,6 @@ class ZWOCameraGUI:
         self._build_center_tabs()
         self._build_mount_column()
 
-        self._focus_update_start_enabled()
-
-    _FOCUS_FN_PRESETS = {
-        "f/2.8": ("32-1000us", 500.0, 90),
-        "f/4": ("1-100ms", 12.0, 120),
-        "f/5.6": ("1-100ms", 28.0, 150),
-        "f/8": ("1-100ms", 55.0, 180),
-        "f/10": ("100ms-1000ms", 200.0, 220),
-        "f/14": ("100ms-1000ms", 550.0, 280),
-    }
-
-    def _build_focusing_tab(self, focus_tab: ctk.CTkFrame):
-        t = self.theme
-        intro = (
-            "Slew to a modest star field. You will capture at the starting focus position, then after each "
-            "shot you rotate the focuser exactly one quarter-turn in the chosen direction, take your hands off, "
-            "wait for the settle countdown, and the app captures again through the full travel."
-        )
-        ctk.CTkLabel(
-            focus_tab,
-            text=intro,
-            font=("Segoe UI", 9),
-            wraplength=260,
-            justify="left",
-            anchor="w",
-        ).pack(anchor="w", padx=4, pady=(6, 8))
-
-        row = ctk.CTkFrame(focus_tab, fg_color="transparent")
-        row.pack(fill=tk.X, padx=4, pady=2)
-        ctk.CTkLabel(row, text="Telescope f/# (preset)", font=("Segoe UI", 9)).pack(side=tk.LEFT)
-        self._focus_fn_var = tk.StringVar(value="f/8")
-        self._focus_fn_menu = ctk.CTkComboBox(
-            row,
-            values=["Custom", "f/2.8", "f/4", "f/5.6", "f/8", "f/10", "f/14"],
-            variable=self._focus_fn_var,
-            width=120,
-            state="readonly",
-        )
-        self._focus_fn_menu.set("f/8")
-        self._focus_fn_menu.pack(side=tk.RIGHT, padx=(4, 0))
-
-        row2 = ctk.CTkFrame(focus_tab, fg_color="transparent")
-        row2.pack(fill=tk.X, padx=4, pady=2)
-        ctk.CTkLabel(row2, text="Settle time (s)", font=("Segoe UI", 9)).pack(side=tk.LEFT)
-        self._focus_settle_var = tk.StringVar(value="3")
-        self._focus_settle_entry = ctk.CTkEntry(row2, width=50, textvariable=self._focus_settle_var)
-        self._focus_settle_entry.pack(side=tk.RIGHT)
-
-        row3 = ctk.CTkFrame(focus_tab, fg_color="transparent")
-        row3.pack(fill=tk.X, padx=4, pady=2)
-        ctk.CTkLabel(row3, text="Quarter-turns to sweep", font=("Segoe UI", 9)).pack(side=tk.LEFT)
-        self._focus_turns_var = tk.StringVar(value="20")
-        self._focus_turns_entry = ctk.CTkEntry(row3, width=50, textvariable=self._focus_turns_var)
-        self._focus_turns_entry.pack(side=tk.RIGHT)
-
-        row4 = ctk.CTkFrame(focus_tab, fg_color="transparent")
-        row4.pack(fill=tk.X, padx=4, pady=2)
-        ctk.CTkLabel(row4, text="Each step, turn toward", font=("Segoe UI", 9)).pack(side=tk.LEFT)
-        self._focus_dir_var = tk.StringVar(value="infinity")
-        ctk.CTkRadioButton(row4, text="Infinity", variable=self._focus_dir_var, value="infinity").pack(side=tk.LEFT, padx=4)
-        ctk.CTkRadioButton(row4, text="Near", variable=self._focus_dir_var, value="near").pack(side=tk.LEFT)
-
-        self._focus_phase_label = ctk.CTkLabel(
-            focus_tab,
-            text="Idle.",
-            font=("Segoe UI", 10, "bold"),
-            wraplength=270,
-            justify="left",
-            anchor="w",
-        )
-        self._focus_phase_label.pack(anchor="w", padx=4, pady=(10, 4))
-
-        self._focus_countdown_label = ctk.CTkLabel(
-            focus_tab,
-            text="",
-            font=("Segoe UI", 11),
-            wraplength=270,
-            justify="left",
-            anchor="w",
-        )
-        self._focus_countdown_label.pack(anchor="w", padx=4, pady=2)
-
-        self._focus_progress_label = ctk.CTkLabel(focus_tab, text="", font=("Segoe UI", 9))
-        self._focus_progress_label.pack(anchor="w", padx=4, pady=2)
-
-        self._focus_results = ctk.CTkTextbox(focus_tab, height=120, width=280, font=("Courier New", 9))
-        self._focus_results.pack(fill=tk.BOTH, expand=True, padx=4, pady=6)
-
-        bf = ctk.CTkFrame(focus_tab, fg_color="transparent")
-        bf.pack(fill=tk.X, padx=4, pady=6)
-        self._focus_arm_btn = ctk.CTkButton(
-            bf,
-            text="Apply f/# preset to Camera tab",
-            command=self._focus_apply_preset_only,
-            width=200,
-            font=("Segoe UI", 9),
-        )
-        self._focus_arm_btn.pack(fill=tk.X, pady=2)
-        self._focus_start_btn = ctk.CTkButton(
-            bf,
-            text="Start focus sweep",
-            command=self._focus_start_sweep,
-            width=200,
-            font=("Segoe UI", 9, "bold"),
-            fg_color=t["accent"],
-            hover_color=t["accent_light"],
-        )
-        self._focus_start_btn.pack(fill=tk.X, pady=2)
-        self._focus_cancel_btn = ctk.CTkButton(
-            bf,
-            text="Cancel sweep",
-            command=self._focus_cancel_sweep,
-            width=200,
-            font=("Segoe UI", 9),
-            state="disabled",
-        )
-        self._focus_cancel_btn.pack(fill=tk.X, pady=2)
-        self._focus_restore_btn = ctk.CTkButton(
-            bf,
-            text="Restore previous camera settings",
-            command=self._focus_restore_saved,
-            width=200,
-            font=("Segoe UI", 9),
-        )
-        self._focus_restore_btn.pack(fill=tk.X, pady=2)
-
-        self._focus_update_start_enabled()
-
-    def _focus_update_start_enabled(self):
-        ok = bool(self.camera and self.camera_initialized)
-        try:
-            self._focus_start_btn.configure(state="normal" if ok else "disabled")
-        except Exception:
-            pass
-
-    def _focus_save_camera_snapshot(self):
-        self._focus_saved_camera = {
-            "exposure_range": self.exposure_range_var.get(),
-            "exposure": float(self.exposure_var.get()),
-            "gain": int(self.gain_var.get()),
-            "binning": self.binning_dropdown.get(),
-            "format": self.format_var.get(),
-        }
-
-    def _focus_restore_saved(self):
-        if not self._focus_saved_camera:
-            messagebox.showinfo("Focus assist", "No saved settings to restore. Run a sweep first or use Apply preset.")
-            return
-        if not self.camera or not self.camera_initialized:
-            messagebox.showwarning("Focus assist", "Connect a camera first.")
-            return
-        self._focus_apply_snapshot_to_ui(self._focus_saved_camera)
-        self._focus_saved_camera = None
-        self.update_status("Restored camera settings from before focus assist.")
-
-    def _focus_apply_preset_only(self):
-        if not self.camera or not self.camera_initialized:
-            messagebox.showwarning("Focus assist", "Connect a camera first.")
-            return
-        fn = self._focus_fn_var.get()
-        if fn == "Custom":
-            messagebox.showinfo("Focus assist", "Choose an f/# other than Custom to apply a preset.")
-            return
-        if self._focus_saved_camera is None:
-            self._focus_save_camera_snapshot()
-        preset = self._FOCUS_FN_PRESETS.get(fn)
-        if not preset:
-            return
-        rng, exp, gain = preset
-        gain = self._clamp_gain_for_camera(gain)
-        self.exposure_range_var.set(rng)
-        self.update_exposure_range()
-        self.exposure_var.set(float(exp))
-        self.exposure_slider.set(float(exp))
-        self.update_exposure(float(exp))
-        self.gain_var.set(int(gain))
-        self.gain_slider.set(int(gain))
-        self.update_gain(int(gain))
-        self.binning_dropdown.set("1x1")
-        self.update_binning()
-        self.format_var.set("RAW16")
-        self.update_image_format()
-        self.update_status(f"Focus preset applied: {fn}, RAW16, 1×1, {rng}.")
-
-    def _focus_apply_snapshot_to_ui(self, s: dict):
-        self.exposure_range_var.set(s["exposure_range"])
-        self.update_exposure_range()
-        self.exposure_var.set(s["exposure"])
-        self.exposure_slider.set(s["exposure"])
-        self.update_exposure(s["exposure"])
-        self.gain_var.set(s["gain"])
-        self.gain_slider.set(s["gain"])
-        self.update_gain(s["gain"])
-        self.binning_dropdown.set(s["binning"])
-        self.update_binning()
-        self.format_var.set(s["format"])
-        self.update_image_format()
-
-    def _focus_cancel_sweep(self):
-        self._focus_generation += 1
-        self._focus_cancel.set()
-        try:
-            self._focus_countdown_label.configure(text="Cancelled.")
-            self._focus_phase_label.configure(text="Idle (cancelled).")
-            self._focus_start_btn.configure(state="normal" if self.camera and self.camera_initialized else "disabled")
-            self._focus_cancel_btn.configure(state="disabled")
-        except Exception:
-            pass
-        if self._focus_saved_camera:
-            self._focus_apply_snapshot_to_ui(self._focus_saved_camera)
-        self._focus_cancel.clear()
-
-    def _focus_run_dir(self) -> str:
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        return os.path.join(self.save_path, "FocusAssist", ts)
-
-    def _focus_start_sweep(self):
-        if not self.camera or not self.camera_initialized:
-            messagebox.showwarning("Focus assist", "Connect a camera first.")
-            return
-        try:
-            settle_s = max(0, int(self._focus_settle_var.get().strip()))
-            n_turns = max(1, int(self._focus_turns_var.get().strip()))
-        except ValueError:
-            messagebox.showwarning("Focus assist", "Enter integers for settle time and quarter-turns.")
-            return
-
-        self._maybe_warn_solar_filter_daytime("running the focus sweep")
-
-        if self._focus_saved_camera is None:
-            self._focus_save_camera_snapshot()
-
-        fn = self._focus_fn_var.get()
-        if fn != "Custom":
-            preset = self._FOCUS_FN_PRESETS.get(fn)
-            if preset:
-                rng, exp, gain = preset
-                gain = self._clamp_gain_for_camera(gain)
-                self.exposure_range_var.set(rng)
-                self.update_exposure_range()
-                self.exposure_var.set(float(exp))
-                self.exposure_slider.set(float(exp))
-                self.update_exposure(float(exp))
-                self.gain_var.set(int(gain))
-                self.gain_slider.set(int(gain))
-                self.update_gain(int(gain))
-                self.binning_dropdown.set("1x1")
-                self.update_binning()
-                self.format_var.set("RAW16")
-                self.update_image_format()
-
-        n_captures = n_turns + 1
-        self._focus_scores = []
-        self._focus_sweep_metric_mode = None
-        self._focus_cancel.clear()
-        self._focus_generation += 1
-        gen = self._focus_generation
-
-        self._focus_results.delete("1.0", tk.END)
-        run_dir = self._focus_run_dir()
-        try:
-            os.makedirs(run_dir, exist_ok=True)
-        except OSError as e:
-            messagebox.showerror("Focus assist", f"Cannot create folder:\n{e}")
-            return
-
-        self._focus_was_previewing = self._stop_preview_for_still()
-        range_text = self.exposure_range_var.get()
-        exp_val = float(self.exposure_var.get())
-        gain = int(self.gain_var.get())
-        bin_value = int(self.binning_dropdown.get().split("x")[0])
-        img_fmt = self.format_var.get()
-
-        try:
-            self._configure_still_capture_hardware(
-                bin_value=bin_value,
-                image_format=img_fmt,
-                range_text=range_text,
-                exposure_val=exp_val,
-                gain=gain,
-            )
-        except Exception as e:
-            messagebox.showerror("Focus assist", str(e))
-            if getattr(self, "_focus_was_previewing", False):
-                self.start_preview()
-            return
-
-        self._focus_start_btn.configure(state="disabled")
-        self._focus_cancel_btn.configure(state="normal")
-        self._focus_phase_label.configure(text="Prepare: point at stars and move focus to your starting end of travel.")
-        self._focus_countdown_label.configure(text="")
-
-        toward = self._focus_dir_var.get()
-        toward_txt = "infinity" if toward == "infinity" else "near focus"
-
-        def after_sweep_done():
-            if gen != self._focus_generation:
-                return
-            self._focus_start_btn.configure(state="normal" if self.camera and self.camera_initialized else "disabled")
-            self._focus_cancel_btn.configure(state="disabled")
-            if getattr(self, "_focus_was_previewing", False):
-                self.start_preview()
-            if not self._focus_scores:
-                self._focus_phase_label.configure(text="Sweep finished (no scores).")
-                return
-            qualities = [q for _, q, _ in self._focus_scores]
-            best_i = int(np.argmax(qualities))
-            best_q = qualities[best_i]
-            last_i = len(self._focus_scores) - 1
-            delta = last_i - best_i
-            opp = "near focus" if toward == "infinity" else "infinity"
-            mode_note = f"Metric mode for this run: {self._focus_sweep_metric_mode or 'n/a'}"
-            lines = [
-                f"Folder: {run_dir}",
-                mode_note,
-                f"Best sample: step {best_i} (0 = first capture at start position)",
-                f"Metric (higher is sharper): {best_q:.4g}",
-                "",
-            ]
-            for i, q, desc in self._focus_scores:
-                lines.append(f"  step {i:02d}: {q:.4g}  ({desc})")
-            lines.append("")
-            if delta == 0:
-                lines.append("You are already at the best focus position (last step).")
-            else:
-                lines.append(
-                    f"From your current focus position (step {last_i}), turn the focuser {delta} quarter-turn(s) "
-                    f"toward {opp} (opposite to the sweep direction), hands off between turns, then verify with preview."
-                )
-            self._focus_results.insert(tk.END, "\n".join(lines))
-            self._focus_phase_label.configure(text=f"Best focus at step {best_i}. See results below.")
-            self.update_status("Focus sweep complete.")
-
-        def capture_step(step_idx: int):
-            if gen != self._focus_generation or self._focus_cancel.is_set():
-                after_sweep_done()
-                return
-
-            def do_cap():
-                if gen != self._focus_generation or self._focus_cancel.is_set():
-                    self.root.after(0, after_sweep_done)
-                    return
-                try:
-                    frame = self._grab_still_frame()
-                    q, desc = self._focus_quality_for_sweep_step(frame, img_fmt)
-                    fn_out = os.path.join(run_dir, f"step_{step_idx:03d}.fits")
-                    _, exp_s = self._exposure_us_display_seconds(range_text, exp_val)
-                    header = fits.Header()
-                    header["INSTRUME"] = self.camera_info["Name"]
-                    header["EXPOSURE"] = (exp_s, "Exposure time in seconds")
-                    header["GAIN"] = (gain, "Gain")
-                    header["BINNING"] = (bin_value, "Binning")
-                    header["FOCUSSTEP"] = (step_idx, "Focus sweep step index")
-                    header["FOCUSMETR"] = (q, "Focus quality (higher sharper)")
-                    fits.PrimaryHDU(data=frame, header=header).writeto(fn_out, overwrite=True)
-                    self._focus_scores.append((step_idx, q, desc))
-                    self.root.after(
-                        0,
-                        lambda s=step_idx, ds=desc, tot=n_captures: self._focus_progress_label.configure(
-                            text=f"Captured step {s + 1}/{tot} — {ds}"
-                        ),
-                    )
-                except Exception as e:
-                    self.root.after(
-                        0,
-                        lambda err=e, si=step_idx: messagebox.showerror(
-                            "Focus assist", f"Capture failed at step {si}:\n{err}"
-                        ),
-                    )
-                    self.root.after(0, after_sweep_done)
-                    return
-
-                if step_idx >= n_captures - 1:
-                    self.root.after(0, after_sweep_done)
-                    return
-
-                def next_turn():
-                    if gen != self._focus_generation or self._focus_cancel.is_set():
-                        self.root.after(0, after_sweep_done)
-                        return
-                    self._focus_phase_label.configure(
-                        text=(
-                            f"Step {step_idx + 2}/{n_captures}: rotate the focuser exactly ONE quarter-turn "
-                            f"toward {toward_txt}. Remove your hands from the telescope."
-                        )
-                    )
-                    self._schedule_focus_settle(settle_s, lambda: capture_step(step_idx + 1))
-
-                self.root.after(0, next_turn)
-
-            threading.Thread(target=do_cap, daemon=True).start()
-
-        def settle_then_first():
-            if gen != self._focus_generation or self._focus_cancel.is_set():
-                after_sweep_done()
-                return
-            self._focus_phase_label.configure(
-                text="Starting position: hands off the scope. Wait for the countdown, then we capture."
-            )
-            self._schedule_focus_settle(settle_s, lambda: capture_step(0))
-
-        settle_then_first()
-
-    def _schedule_focus_settle(self, settle_s: int, on_done):
-        if self._focus_cancel.is_set():
-            return
-
-        def tick(remaining: int):
-            if self._focus_cancel.is_set():
-                return
-            if remaining <= 0:
-                self._focus_countdown_label.configure(text="Capturing now.")
-                try:
-                    self.root.bell()
-                except Exception:
-                    pass
-                on_done()
-                return
-            self._focus_countdown_label.configure(
-                text=f"Stabilizing… {remaining}s — hands off the tripod / scope."
-            )
-            self.root.after(1000, lambda: tick(remaining - 1))
-
-        tick(settle_s)
-
     def _build_center_tabs(self):
         t = self.theme
         self._center_tabs = ctk.CTkTabview(
@@ -1865,7 +1416,7 @@ class ZWOCameraGUI:
         live = self._center_tabs.tab("Live preview")
         self.preview_label = tk.Label(
             live,
-            text="No preview available\nConnect camera and start preview",
+            text="No preview available\nConnect a camera for live preview",
             font=("Segoe UI", 12),
             justify=tk.CENTER,
         )
@@ -1884,18 +1435,18 @@ class ZWOCameraGUI:
         ).pack(side=tk.LEFT, padx=(0, 8))
         ctk.CTkButton(
             sbtn,
-            text="Use last capture",
-            command=self._session_use_last_for_plate,
-            width=140,
-            font=("Segoe UI", 9),
-        ).pack(side=tk.LEFT, padx=(0, 8))
-        ctk.CTkButton(
-            sbtn,
             text="Scan for solved FITS",
             command=self._backfill_session_radec_from_disk,
             width=150,
             font=("Segoe UI", 9),
         ).pack(side=tk.LEFT)
+        ctk.CTkButton(
+            sbtn,
+            text="Generate PDF report",
+            command=self._generate_session_pdf_report,
+            width=170,
+            font=("Segoe UI", 9, "bold"),
+        ).pack(side=tk.LEFT, padx=(8, 0))
         list_wrap = tk.Frame(session_tab)
         list_wrap.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
         self._session_listbox = tk.Listbox(
@@ -1954,9 +1505,521 @@ class ZWOCameraGUI:
         self._sky_log = tk.Text(site, height=14, width=48, font=("Courier New", 9), wrap=tk.WORD)
         self._sky_log.pack(fill=tk.BOTH, expand=True, padx=8, pady=(4, 8))
 
+        self._center_tabs.add("Deep Sky")
+        deep = self._center_tabs.tab("Deep Sky")
+        self._build_deep_sky_tab(deep)
+
         self._center_tabs.add("Plate solve")
         plate = self._center_tabs.tab("Plate solve")
         self._build_plate_solve_tab(plate)
+
+    # ──────────────────────────────────────────────────────────────────────
+    #  Deep Sky tab — offline stacking workflow (lights + calibration frames)
+    # ──────────────────────────────────────────────────────────────────────
+    def _build_deep_sky_tab(self, parent):
+        t = self.theme
+
+        try:
+            parent.configure(fg_color=t["bg_primary"])
+        except Exception:
+            pass
+
+        scroll = ctk.CTkScrollableFrame(parent, fg_color=t["bg_primary"])
+        scroll.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+
+        ctk.CTkLabel(
+            scroll,
+            text="Deep Sky stacking (offline)",
+            font=("Segoe UI", 13, "bold"),
+            text_color=t["fg_primary"],
+        ).pack(anchor="w", padx=8, pady=(8, 2))
+        ctk.CTkLabel(
+            scroll,
+            text="Pick FITS lights and optional dark/flat/bias frames, then "
+                 "stack — runs locally, no internet required.",
+            font=("Segoe UI", 9),
+            text_color=t["fg_secondary"],
+            wraplength=520,
+            justify="left",
+        ).pack(anchor="w", padx=8, pady=(0, 6))
+
+        self._dsk_count_lights_var = tk.StringVar(value="0 frames")
+        self._dsk_count_darks_var = tk.StringVar(value="0 frames")
+        self._dsk_count_flats_var = tk.StringVar(value="0 frames")
+        self._dsk_count_bias_var = tk.StringVar(value="0 frames")
+
+        self._dsk_build_picker_row(
+            scroll, "Lights (required)", self._dsk_count_lights_var, "lights"
+        )
+        self._dsk_build_picker_row(
+            scroll, "Darks (optional)", self._dsk_count_darks_var, "darks"
+        )
+        self._dsk_build_picker_row(
+            scroll, "Flats (optional)", self._dsk_count_flats_var, "flats"
+        )
+        self._dsk_build_picker_row(
+            scroll, "Bias (optional)", self._dsk_count_bias_var, "bias"
+        )
+
+        # Settings ------------------------------------------------------------
+        settings = ctk.CTkFrame(scroll, fg_color=t["bg_secondary"])
+        settings.pack(fill=tk.X, padx=8, pady=(4, 4))
+
+        ctk.CTkLabel(
+            settings, text="Settings", font=("Segoe UI", 10, "bold"),
+            text_color=t["fg_primary"],
+        ).grid(row=0, column=0, columnspan=4, sticky="w", padx=8, pady=(6, 4))
+
+        ctk.CTkLabel(settings, text="Combine", text_color=t["fg_primary"]).grid(
+            row=1, column=0, sticky="w", padx=8, pady=2
+        )
+        self._dsk_combine_menu = ctk.CTkOptionMenu(
+            settings, values=list(deep_sky_stacker.COMBINE_METHODS), width=120,
+        )
+        self._dsk_combine_menu.set("sigma_clip")
+        self._dsk_combine_menu.grid(row=1, column=1, sticky="w", padx=4, pady=2)
+
+        ctk.CTkLabel(settings, text="σ low", text_color=t["fg_primary"]).grid(
+            row=1, column=2, sticky="e", padx=(8, 2), pady=2
+        )
+        self._dsk_sigma_low_entry = ctk.CTkEntry(settings, width=60)
+        self._dsk_sigma_low_entry.insert(0, "3.0")
+        self._dsk_sigma_low_entry.grid(row=1, column=3, sticky="w", padx=2, pady=2)
+
+        ctk.CTkLabel(settings, text="σ high", text_color=t["fg_primary"]).grid(
+            row=1, column=4, sticky="e", padx=(8, 2), pady=2
+        )
+        self._dsk_sigma_high_entry = ctk.CTkEntry(settings, width=60)
+        self._dsk_sigma_high_entry.insert(0, "3.0")
+        self._dsk_sigma_high_entry.grid(row=1, column=5, sticky="w", padx=2, pady=2)
+
+        ctk.CTkLabel(settings, text="Reference", text_color=t["fg_primary"]).grid(
+            row=2, column=0, sticky="w", padx=8, pady=2
+        )
+        self._dsk_ref_menu = ctk.CTkOptionMenu(
+            settings, values=["auto (most stars)", "first frame"], width=170,
+        )
+        self._dsk_ref_menu.set("auto (most stars)")
+        self._dsk_ref_menu.grid(row=2, column=1, columnspan=2, sticky="w", padx=4, pady=2)
+
+        ctk.CTkLabel(settings, text="Bayer", text_color=t["fg_primary"]).grid(
+            row=2, column=3, sticky="e", padx=(8, 2), pady=2
+        )
+        self._dsk_bayer_menu = ctk.CTkOptionMenu(
+            settings, values=list(deep_sky_stacker.BAYER_PATTERNS), width=110,
+        )
+        self._dsk_bayer_menu.set("auto")
+        self._dsk_bayer_menu.grid(row=2, column=4, columnspan=2, sticky="w", padx=2, pady=2)
+
+        ctk.CTkLabel(settings, text="Stretch", text_color=t["fg_primary"]).grid(
+            row=3, column=0, sticky="w", padx=8, pady=2
+        )
+        self._dsk_stretch_menu = ctk.CTkOptionMenu(
+            settings, values=list(deep_sky_stacker.STRETCH_MODES), width=120,
+        )
+        self._dsk_stretch_menu.set("asinh")
+        self._dsk_stretch_menu.grid(row=3, column=1, sticky="w", padx=4, pady=(2, 6))
+
+        # Output row ----------------------------------------------------------
+        out_row = ctk.CTkFrame(scroll, fg_color="transparent")
+        out_row.pack(fill=tk.X, padx=8, pady=(2, 4))
+        ctk.CTkLabel(out_row, text="Output folder", text_color=t["fg_primary"]).pack(
+            side=tk.LEFT, padx=(0, 4)
+        )
+        self._dsk_output_entry = ctk.CTkEntry(out_row, width=320)
+        self._dsk_output_entry.insert(0, self._dsk_default_output_dir())
+        self._dsk_output_entry.pack(side=tk.LEFT, padx=2)
+        ctk.CTkButton(
+            out_row, text="Browse…", width=80, command=self._dsk_browse_output,
+        ).pack(side=tk.LEFT, padx=4)
+
+        # Action row ----------------------------------------------------------
+        action = ctk.CTkFrame(scroll, fg_color="transparent")
+        action.pack(fill=tk.X, padx=8, pady=(2, 4))
+        self._dsk_stack_btn = ctk.CTkButton(
+            action, text="Stack", width=120, command=self._dsk_start_stack,
+            fg_color=t["accent"], hover_color=t["accent_light"],
+        )
+        self._dsk_stack_btn.pack(side=tk.LEFT)
+        self._dsk_cancel_btn = ctk.CTkButton(
+            action, text="Cancel", width=80, command=self._dsk_cancel_stack,
+            state="disabled",
+        )
+        self._dsk_cancel_btn.pack(side=tk.LEFT, padx=4)
+        self._dsk_progress = ttk.Progressbar(
+            action, orient="horizontal", mode="determinate", length=240,
+        )
+        self._dsk_progress.pack(side=tk.LEFT, padx=8, fill=tk.X, expand=True)
+        self._dsk_status_var = tk.StringVar(value="Idle")
+        ctk.CTkLabel(
+            action, textvariable=self._dsk_status_var, text_color=t["fg_secondary"],
+            font=("Segoe UI", 9),
+        ).pack(side=tk.LEFT, padx=4)
+
+        # Log -----------------------------------------------------------------
+        log_wrap = tk.Frame(scroll, bg=t["bg_primary"])
+        log_wrap.pack(fill=tk.BOTH, expand=False, padx=8, pady=(4, 4))
+        self._dsk_log = tk.Text(
+            log_wrap, height=10, font=("Courier New", 9), wrap=tk.WORD,
+            bg=t["bg_secondary"], fg=t["fg_primary"], insertbackground=t["fg_primary"],
+        )
+        log_sb = tk.Scrollbar(log_wrap, orient=tk.VERTICAL, command=self._dsk_log.yview)
+        self._dsk_log.configure(yscrollcommand=log_sb.set)
+        self._dsk_log.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        log_sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self._dsk_log.insert("end", "Ready. Pick frames and click Stack.\n")
+        self._dsk_log.configure(state="disabled")
+
+        # Result viewer + actions --------------------------------------------
+        result_wrap = ctk.CTkFrame(scroll, fg_color=t["bg_secondary"])
+        result_wrap.pack(fill=tk.BOTH, expand=True, padx=8, pady=(4, 8))
+        ctk.CTkLabel(
+            result_wrap, text="Stacked result", font=("Segoe UI", 10, "bold"),
+            text_color=t["fg_primary"],
+        ).pack(anchor="w", padx=8, pady=(6, 2))
+
+        self._dsk_preview_label = tk.Label(
+            result_wrap, text="No stack yet", bg=t["bg_secondary"], fg=t["fg_secondary"],
+            width=64, height=20, justify=tk.CENTER,
+        )
+        self._dsk_preview_label.pack(padx=8, pady=4)
+
+        result_btns = ctk.CTkFrame(result_wrap, fg_color="transparent")
+        result_btns.pack(fill=tk.X, padx=8, pady=(2, 8))
+        self._dsk_open_folder_btn = ctk.CTkButton(
+            result_btns, text="Open output folder", width=160,
+            command=self._dsk_open_output_folder, state="disabled",
+        )
+        self._dsk_open_folder_btn.pack(side=tk.LEFT, padx=(0, 6))
+        self._dsk_use_plate_btn = ctk.CTkButton(
+            result_btns, text="Use stacked FITS in plate solve", width=220,
+            command=self._dsk_use_in_plate, state="disabled",
+        )
+        self._dsk_use_plate_btn.pack(side=tk.LEFT, padx=(0, 6))
+        self._dsk_save_preview_btn = ctk.CTkButton(
+            result_btns, text="Save preview as…", width=160,
+            command=self._dsk_save_preview_as, state="disabled",
+        )
+        self._dsk_save_preview_btn.pack(side=tk.LEFT)
+
+    # ----- Deep Sky helpers --------------------------------------------------
+
+    def _dsk_build_picker_row(self, parent, label: str, count_var: tk.StringVar, kind: str):
+        """One picker row (Add files / Add folder / Clear) for a frame kind."""
+        t = self.theme
+        row = ctk.CTkFrame(parent, fg_color=t["bg_secondary"])
+        row.pack(fill=tk.X, padx=8, pady=2)
+        ctk.CTkLabel(
+            row, text=label, font=("Segoe UI", 10, "bold"),
+            text_color=t["fg_primary"], width=170, anchor="w",
+        ).pack(side=tk.LEFT, padx=(8, 4), pady=4)
+        ctk.CTkLabel(
+            row, textvariable=count_var, text_color=t["fg_secondary"], width=80,
+        ).pack(side=tk.LEFT, padx=2, pady=4)
+        ctk.CTkButton(
+            row, text="Add files…", width=90,
+            command=lambda k=kind: self._dsk_add_files(k),
+        ).pack(side=tk.LEFT, padx=2, pady=4)
+        ctk.CTkButton(
+            row, text="Add folder…", width=100,
+            command=lambda k=kind: self._dsk_add_folder(k),
+        ).pack(side=tk.LEFT, padx=2, pady=4)
+        ctk.CTkButton(
+            row, text="Clear", width=70,
+            command=lambda k=kind: self._dsk_clear(k),
+        ).pack(side=tk.LEFT, padx=2, pady=4)
+
+    def _dsk_kind_to_attrs(self, kind: str) -> tuple[list[str], tk.StringVar]:
+        if kind == "lights":
+            return self._dsk_lights, self._dsk_count_lights_var
+        if kind == "darks":
+            return self._dsk_darks, self._dsk_count_darks_var
+        if kind == "flats":
+            return self._dsk_flats, self._dsk_count_flats_var
+        if kind == "bias":
+            return self._dsk_bias, self._dsk_count_bias_var
+        raise ValueError(f"unknown frame kind: {kind}")
+
+    def _dsk_default_output_dir(self) -> str:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        project = ""
+        try:
+            project = self.project_name_entry.get().strip()
+        except Exception:
+            pass
+        if project:
+            return os.path.join(self.save_path, project, "Stacks", ts)
+        return os.path.join(self.save_path, "Stacks", ts)
+
+    def _dsk_default_dir_for_kind(self, kind: str) -> str:
+        kind_to_folder = {
+            "lights": "Light", "darks": "Dark", "flats": "Flat", "bias": "Bias",
+        }
+        sub = kind_to_folder.get(kind, "")
+        try:
+            project = self.project_name_entry.get().strip()
+        except Exception:
+            project = ""
+        candidates = []
+        if project:
+            candidates.append(os.path.join(self.save_path, project, sub))
+            candidates.append(os.path.join(self.save_path, project))
+        candidates.append(os.path.join(self.save_path, sub))
+        candidates.append(self.save_path)
+        for c in candidates:
+            if os.path.isdir(c):
+                return c
+        return self.save_path
+
+    def _dsk_add_files(self, kind: str):
+        paths_list, count_var = self._dsk_kind_to_attrs(kind)
+        initdir = self._dsk_default_dir_for_kind(kind)
+        files = filedialog.askopenfilenames(
+            title=f"Select {kind} FITS files",
+            initialdir=initdir,
+            filetypes=[("FITS", "*.fits *.fit *.fts"), ("All files", "*.*")],
+        )
+        if not files:
+            return
+        added = 0
+        for f in files:
+            ap = os.path.abspath(f)
+            if ap not in paths_list:
+                paths_list.append(ap)
+                added += 1
+        count_var.set(f"{len(paths_list)} frames")
+        self._dsk_log_line(f"Added {added} {kind} file(s); total {len(paths_list)}.")
+
+    def _dsk_add_folder(self, kind: str):
+        paths_list, count_var = self._dsk_kind_to_attrs(kind)
+        initdir = self._dsk_default_dir_for_kind(kind)
+        folder = filedialog.askdirectory(
+            title=f"Select {kind} folder", initialdir=initdir
+        )
+        if not folder:
+            return
+        added = 0
+        for name in sorted(os.listdir(folder)):
+            ext = os.path.splitext(name)[1].lower()
+            if ext not in (".fits", ".fit", ".fts"):
+                continue
+            ap = os.path.abspath(os.path.join(folder, name))
+            if ap not in paths_list:
+                paths_list.append(ap)
+                added += 1
+        count_var.set(f"{len(paths_list)} frames")
+        self._dsk_log_line(
+            f"Added {added} {kind} file(s) from {folder}; total {len(paths_list)}."
+        )
+
+    def _dsk_clear(self, kind: str):
+        paths_list, count_var = self._dsk_kind_to_attrs(kind)
+        paths_list.clear()
+        count_var.set("0 frames")
+        self._dsk_log_line(f"Cleared {kind}.")
+
+    def _dsk_browse_output(self):
+        current = self._dsk_output_entry.get().strip() or self.save_path
+        parent = current if os.path.isdir(current) else (
+            os.path.dirname(current) if current else self.save_path
+        )
+        folder = filedialog.askdirectory(title="Output folder", initialdir=parent)
+        if folder:
+            self._dsk_output_entry.delete(0, "end")
+            self._dsk_output_entry.insert(0, folder)
+
+    def _dsk_log_line(self, msg: str):
+        try:
+            self._dsk_log.configure(state="normal")
+            self._dsk_log.insert("end", msg + "\n")
+            self._dsk_log.see("end")
+            self._dsk_log.configure(state="disabled")
+        except Exception:
+            pass
+
+    def _dsk_set_busy(self, busy: bool):
+        try:
+            self._dsk_stack_btn.configure(state="disabled" if busy else "normal")
+            self._dsk_cancel_btn.configure(state="normal" if busy else "disabled")
+        except Exception:
+            pass
+
+    def _dsk_start_stack(self):
+        if self._dsk_thread is not None and self._dsk_thread.is_alive():
+            return
+        if not self._dsk_lights:
+            messagebox.showinfo("Deep Sky", "Add at least one light frame first.")
+            return
+
+        try:
+            sig_lo = float(self._dsk_sigma_low_entry.get())
+            sig_hi = float(self._dsk_sigma_high_entry.get())
+        except Exception:
+            messagebox.showwarning("Deep Sky", "Sigma low/high must be numbers.")
+            return
+
+        out_dir = self._dsk_output_entry.get().strip()
+        if not out_dir:
+            out_dir = self._dsk_default_output_dir()
+            self._dsk_output_entry.insert(0, out_dir)
+
+        ref_choice = self._dsk_ref_menu.get()
+        ref_index = 0 if ref_choice == "first frame" else None
+
+        cfg = deep_sky_stacker.StackConfig(
+            light_paths=list(self._dsk_lights),
+            dark_paths=list(self._dsk_darks),
+            flat_paths=list(self._dsk_flats),
+            bias_paths=list(self._dsk_bias),
+            output_dir=out_dir,
+            output_basename="stack_" + datetime.now().strftime("%Y%m%d_%H%M%S"),
+            combine=self._dsk_combine_menu.get(),
+            sigma_low=sig_lo,
+            sigma_high=sig_hi,
+            reference_index=ref_index,
+            stretch=self._dsk_stretch_menu.get(),
+            bayer_pattern=self._dsk_bayer_menu.get(),
+            cancel_event=self._dsk_cancel,
+        )
+
+        self._dsk_cancel.clear()
+        self._dsk_set_busy(True)
+        self._dsk_progress.configure(value=0, maximum=100)
+        self._dsk_status_var.set("Starting…")
+        self._dsk_log_line("=" * 50)
+        self._dsk_log_line(
+            f"Stacking {len(cfg.light_paths)} lights "
+            f"(D={len(cfg.dark_paths)}, F={len(cfg.flat_paths)}, "
+            f"B={len(cfg.bias_paths)}); combine={cfg.combine}, stretch={cfg.stretch}."
+        )
+
+        def _worker():
+            try:
+                result = deep_sky_stacker.run_stack_job(
+                    cfg,
+                    progress_cb=self._dsk_progress_cb,
+                    log_cb=self._dsk_log_cb,
+                )
+            except Exception as e:
+                import traceback
+                tb = traceback.format_exc()
+                result = deep_sky_stacker.StackResult(
+                    success=False, message=f"Worker crashed: {e}\n{tb}"
+                )
+            self.root.after(0, lambda r=result: self._dsk_on_done(r))
+
+        self._dsk_thread = threading.Thread(target=_worker, daemon=True)
+        self._dsk_thread.start()
+
+    def _dsk_progress_cb(self, done: int, total: int, label: str):
+        def _apply():
+            try:
+                pct = 0 if total <= 0 else int(round(100.0 * done / max(1, total)))
+                self._dsk_progress.configure(value=max(0, min(100, pct)))
+                self._dsk_status_var.set(f"{label} ({done}/{total})")
+            except Exception:
+                pass
+        self.root.after(0, _apply)
+
+    def _dsk_log_cb(self, msg: str):
+        self.root.after(0, lambda m=msg: self._dsk_log_line(m))
+
+    def _dsk_cancel_stack(self):
+        if self._dsk_thread is not None and self._dsk_thread.is_alive():
+            self._dsk_cancel.set()
+            self._dsk_status_var.set("Cancelling…")
+            self._dsk_log_line("Cancellation requested.")
+
+    def _dsk_on_done(self, result):
+        self._dsk_set_busy(False)
+        self._dsk_last_result = result
+        if not result.success:
+            self._dsk_status_var.set("Failed")
+            self._dsk_log_line(f"FAILED: {result.message}")
+            messagebox.showerror("Deep Sky", result.message or "Stacking failed.")
+            return
+        self._dsk_progress.configure(value=100)
+        self._dsk_status_var.set(
+            f"Done — {result.n_used} stacked, {result.n_skipped} skipped"
+        )
+        self._dsk_log_line("SUCCESS: " + result.message)
+        self._dsk_log_line(f"  FITS:    {result.fits_path}")
+        self._dsk_log_line(f"  Preview: {result.preview_path}")
+        self._dsk_show_preview(result.preview_path)
+        try:
+            self._dsk_open_folder_btn.configure(state="normal")
+            self._dsk_use_plate_btn.configure(state="normal")
+            self._dsk_save_preview_btn.configure(state="normal")
+        except Exception:
+            pass
+        self.update_status(
+            f"Stacked {result.n_used} frames -> {os.path.basename(result.fits_path)}"
+        )
+
+    def _dsk_show_preview(self, png_path: str):
+        try:
+            if not png_path or not os.path.isfile(png_path):
+                return
+            pil = Image.open(png_path)
+            max_w, max_h = 720, 480
+            w, h = pil.size
+            scale = min(max_w / max(1, w), max_h / max(1, h), 1.0)
+            if scale < 1.0:
+                pil = pil.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+            self._dsk_preview_imgtk = ImageTk.PhotoImage(pil)
+            self._dsk_preview_label.configure(
+                image=self._dsk_preview_imgtk, text="", width=pil.size[0], height=pil.size[1],
+            )
+        except Exception as e:
+            self._dsk_log_line(f"Preview display failed: {e}")
+
+    def _dsk_open_output_folder(self):
+        if self._dsk_last_result is None or not self._dsk_last_result.fits_path:
+            return
+        folder = os.path.dirname(self._dsk_last_result.fits_path) or self.save_path
+        try:
+            if sys.platform == "darwin":
+                os.system(f'open "{folder}"')
+            elif sys.platform.startswith("linux"):
+                os.system(f'xdg-open "{folder}"')
+            elif sys.platform == "win32":
+                os.startfile(folder)  # type: ignore[attr-defined]
+        except Exception as e:
+            messagebox.showwarning("Deep Sky", f"Could not open folder: {e}")
+
+    def _dsk_use_in_plate(self):
+        if self._dsk_last_result is None or not self._dsk_last_result.fits_path:
+            return
+        if not hasattr(self, "_plate_path_entry"):
+            messagebox.showinfo("Deep Sky", "Plate solve tab is not available.")
+            return
+        try:
+            self._plate_path_entry.delete(0, "end")
+            self._plate_path_entry.insert(0, self._dsk_last_result.fits_path)
+            self._focus_center_tab("Plate solve")
+            self.update_status("Stacked FITS copied — open Plate solve")
+        except Exception as e:
+            messagebox.showwarning("Deep Sky", f"Could not load into plate solve: {e}")
+
+    def _dsk_save_preview_as(self):
+        if self._dsk_last_result is None or not self._dsk_last_result.preview_path:
+            return
+        src = self._dsk_last_result.preview_path
+        if not os.path.isfile(src):
+            return
+        target = filedialog.asksaveasfilename(
+            title="Save preview PNG", defaultextension=".png",
+            filetypes=[("PNG", "*.png")],
+            initialfile=os.path.basename(src),
+        )
+        if not target:
+            return
+        try:
+            with open(src, "rb") as fr, open(target, "wb") as fw:
+                fw.write(fr.read())
+            self._dsk_log_line(f"Saved preview copy -> {target}")
+        except Exception as e:
+            messagebox.showwarning("Deep Sky", f"Save failed: {e}")
 
     # ──────────────────────────────────────────────────────────────────────
     #  Plate-solve tab — always-red palette, equipment preset, target tools
@@ -2097,16 +2160,35 @@ class ZWOCameraGUI:
         )
         self._preset_scale_label.pack(side=tk.LEFT)
 
-        # Preset buttons row.
+        # Preset buttons row — telescope quick-select (three options) + save / recompute.
         preset_btn_row = ctk.CTkFrame(preset_box, fg_color="transparent")
         _track(preset_btn_row)
         preset_btn_row.pack(fill=tk.X, padx=8, pady=(0, 8))
+        _label(preset_btn_row, "Telescope preset", size=9).pack(side=tk.LEFT, padx=(0, 4))
+        self._plate_telescope_combo = _track(
+            ctk.CTkComboBox(
+                preset_btn_row,
+                values=list(PLATE_SOLVE_TELESCOPE_MENU_LABELS),
+                width=220,
+                state="readonly",
+                fg_color=pal["bg"],
+                border_color=pal["border"],
+                button_color=pal["accent_dim"],
+                button_hover_color=pal["accent_hover"],
+                text_color=pal["fg"],
+                dropdown_fg_color=pal["bg_alt"],
+                dropdown_hover_color=pal["accent_dim"],
+                dropdown_text_color=pal["fg"],
+            )
+        )
+        self._plate_telescope_combo.set(PLATE_SOLVE_TELESCOPE_MENU_LABELS[0])
+        self._plate_telescope_combo.pack(side=tk.LEFT, padx=(0, 6))
         _btn(
             preset_btn_row,
-            "Apply Tucson SCT @ 2032 mm",
-            self._apply_default_tucson_preset,
+            "Apply telescope",
+            self._apply_selected_plate_telescope_preset,
             primary=True,
-            width=200,
+            width=130,
         ).pack(side=tk.LEFT, padx=(0, 6))
         _btn(preset_btn_row, "Save preset", self._save_preset_from_ui, width=110).pack(
             side=tk.LEFT, padx=2
@@ -2202,19 +2284,24 @@ class ZWOCameraGUI:
         action_row = ctk.CTkFrame(outer, fg_color="transparent")
         _track(action_row)
         action_row.pack(fill=tk.X, padx=8, pady=(2, 4))
-        _btn(
+        self._plate_solve_btn = _btn(
             action_row,
             "SOLVE",
             self._run_embedded_plate_solve,
             primary=True,
             width=200,
-        ).pack(side=tk.LEFT, padx=(0, 6))
+        )
+        self._plate_solve_btn.pack(side=tk.LEFT, padx=(0, 6))
         _btn(
             action_row,
             "Download indexes for FOV",
             self._download_recommended_astrometry_indexes,
             width=240,
         ).pack(side=tk.LEFT, padx=4)
+        self._plate_solve_status = tk.StringVar(value="Idle")
+        self._plate_solve_status_lbl = _label(action_row, "Status: Idle", dim=True, size=9)
+        self._plate_solve_status_lbl.configure(textvariable=self._plate_solve_status)
+        self._plate_solve_status_lbl.pack(side=tk.LEFT, padx=(10, 0))
 
         out_box = _section_frame(outer)
         out_box.pack(fill=tk.BOTH, expand=True, padx=8, pady=(2, 8))
@@ -2293,6 +2380,53 @@ class ZWOCameraGUI:
                 self._plate_preset_label.configure(text=self._format_preset_summary())
             except Exception:
                 pass
+        self._sync_plate_telescope_combo_from_preset()
+
+    def _sync_plate_telescope_combo_from_preset(self):
+        """Align the plate-solve telescope combobox with the saved focal length."""
+        combo = getattr(self, "_plate_telescope_combo", None)
+        if combo is None:
+            return
+        scope = self.astro_preset.get("telescope", {}) or {}
+        try:
+            f_mm = float(scope.get("focal_length_mm", 0) or 0)
+        except Exception:
+            f_mm = 0.0
+        sct_f = float(DEFAULT_ASTRO_PRESET["telescope"]["focal_length_mm"])
+        labels = PLATE_SOLVE_TELESCOPE_MENU_LABELS
+        if abs(f_mm - sct_f) < 0.5:
+            combo.set(labels[0])
+        elif abs(f_mm - PLATE_SOLVE_REFRACTOR_4IN_FOCAL_MM) < 0.5:
+            combo.set(labels[1])
+        else:
+            combo.set(labels[2])
+
+    def _apply_selected_plate_telescope_preset(self):
+        """Apply the combobox choice: bundled SCT, 4\" / 660 mm refractor, or custom hint."""
+        sel = self._plate_telescope_combo.get()
+        labels = PLATE_SOLVE_TELESCOPE_MENU_LABELS
+        if sel == labels[0]:
+            self._apply_default_tucson_preset()
+        elif sel == labels[1]:
+            self.astro_preset.setdefault("telescope", {}).update(
+                {
+                    "label": PLATE_SOLVE_REFRACTOR_4IN_LABEL,
+                    "focal_length_mm": float(PLATE_SOLVE_REFRACTOR_4IN_FOCAL_MM),
+                }
+            )
+            self._save_astro_preset()
+            self._apply_astro_preset_to_ui()
+            self._recompute_preset_metrics()
+            self._fill_fov_from_preset()
+            self.update_status(
+                'Applied 4" refractor preset (660 mm focal length, 4" aperture).'
+            )
+        else:
+            messagebox.showinfo(
+                "Different telescope",
+                'Enter the telescope name and focal length (mm) in the fields above, then '
+                'use "Save preset" and "Auto FOV from preset" as needed.',
+            )
 
     def _read_preset_inputs(self) -> dict:
         """Pull current preset inputs back from the UI into a dict."""
@@ -2394,6 +2528,7 @@ class ZWOCameraGUI:
         )
         self._save_astro_preset()
         self._recompute_preset_metrics()
+        self._sync_plate_telescope_combo_from_preset()
         self.update_status(f"Saved preset to {self.astro_preset_path.name}")
 
     def _preset_autofill_from_camera(self):
@@ -2547,6 +2682,319 @@ class ZWOCameraGUI:
             camgui_theme=self.theme,
         )
         self.mount_panel.pack(fill=tk.BOTH, expand=True, padx=2, pady=4)
+        self._build_polar_align_panel()
+
+    def _build_polar_align_panel(self):
+        """Red-mode right panel: displays plate-solve based polar alignment guidance."""
+        pal = PLATE_RED_PAL
+        panel = ctk.CTkFrame(
+            self.side_tools,
+            fg_color=pal["bg"],
+            border_color=pal["border"],
+            border_width=1,
+            corner_radius=8,
+        )
+        title = ctk.CTkLabel(
+            panel,
+            text="POLAR ALIGN MODE",
+            font=("Segoe UI", 14, "bold"),
+            text_color=pal["fg"],
+        )
+        title.pack(anchor="w", padx=12, pady=(10, 2))
+        subtitle = ctk.CTkLabel(
+            panel,
+            text="Rough align, plate solve, then adjust mount from this guidance.",
+            font=("Segoe UI", 10),
+            text_color=pal["fg_dim"],
+            justify="left",
+            anchor="w",
+        )
+        subtitle.pack(fill=tk.X, padx=12, pady=(0, 8))
+        fov_row = ctk.CTkFrame(panel, fg_color="transparent")
+        fov_row.pack(fill=tk.X, padx=12, pady=(0, 8))
+        ctk.CTkLabel(
+            fov_row,
+            text="FOV",
+            font=("Segoe UI", 9, "bold"),
+            text_color=pal["fg"],
+        ).pack(side=tk.LEFT, padx=(0, 6))
+        self._polar_align_fov_label = ctk.CTkLabel(
+            fov_row,
+            text=f"{self._polar_align_fov_deg:.1f}°",
+            font=("Segoe UI", 9),
+            text_color=pal["fg_dim"],
+        )
+        self._polar_align_fov_label.pack(side=tk.RIGHT)
+        self._polar_align_fov_slider = ctk.CTkSlider(
+            fov_row,
+            from_=0.1,
+            to=10.0,
+            number_of_steps=99,
+            button_color=pal["accent"],
+            button_hover_color=pal["accent_hover"],
+            progress_color=pal["accent"],
+            fg_color=pal["bg_alt"],
+            command=self._on_polar_align_fov_change,
+        )
+        self._polar_align_fov_slider.set(self._polar_align_fov_deg)
+        self._polar_align_fov_slider.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
+        chart_frame = ctk.CTkFrame(panel, fg_color=pal["bg_alt"], border_color=pal["border"], border_width=1)
+        chart_frame.pack(fill=tk.BOTH, expand=False, padx=12, pady=(0, 8))
+        if _HAS_MATPLOTLIB:
+            self._polar_align_fig, self._polar_align_ax = plt.subplots(figsize=(4.4, 4.4), dpi=100)
+            self._polar_align_canvas = FigureCanvasTkAgg(self._polar_align_fig, master=chart_frame)
+            self._polar_align_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        else:
+            self._polar_align_fig = None
+            self._polar_align_ax = None
+            self._polar_align_canvas = None
+            ctk.CTkLabel(
+                chart_frame,
+                text="Polar diagram unavailable (install matplotlib).",
+                font=("Segoe UI", 10),
+                text_color=pal["fg_dim"],
+            ).pack(fill=tk.X, padx=10, pady=12)
+        self._polar_align_text = tk.Text(
+            panel,
+            height=14,
+            wrap=tk.WORD,
+            font=("Courier New", 10),
+            bg=pal["bg_alt"],
+            fg=pal["fg"],
+            insertbackground=pal["fg"],
+            relief=tk.FLAT,
+            highlightthickness=1,
+            highlightbackground=pal["border"],
+            highlightcolor=pal["accent"],
+            padx=8,
+            pady=8,
+        )
+        self._polar_align_text.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 12))
+        self._polar_align_panel = panel
+        self._refresh_polar_align_panel()
+
+    def _toggle_polar_align_mode(self):
+        self._set_polar_align_mode(not self._polar_align_mode)
+
+    def _set_polar_align_mode(self, enabled: bool):
+        self._polar_align_mode = enabled
+        if enabled:
+            if self.mount_panel is not None:
+                self.mount_panel.pack_forget()
+            if self._polar_align_panel is not None:
+                self._polar_align_panel.pack(fill=tk.BOTH, expand=True, padx=2, pady=4)
+            self._refresh_polar_align_panel()
+            self.update_status("Polar Align Mode enabled.")
+        else:
+            if self._polar_align_panel is not None:
+                self._polar_align_panel.pack_forget()
+            if self.mount_panel is not None:
+                self.mount_panel.pack(fill=tk.BOTH, expand=True, padx=2, pady=4)
+            self.update_status("Mount controls restored.")
+        self.apply_theme()
+
+    def _refresh_polar_align_panel(self):
+        self._redraw_polar_align_plot()
+        out = self._polar_align_text
+        if out is None:
+            return
+        out.delete("1.0", tk.END)
+        out.insert(
+            tk.END,
+            "Workflow:\n"
+            "1) Roughly polar align the mount.\n"
+            "2) Run a plate solve in the center tab.\n"
+            "3) Use the solved offset guidance below to adjust altitude/azimuth.\n\n",
+        )
+        if self._last_solve_ra_deg is None or self._last_solve_dec_deg is None:
+            out.insert(tk.END, "No solved field yet. Plate solve a frame first.\n")
+            return
+        out.insert(
+            tk.END,
+            f"Last solved center: RA {self._last_solve_ra_deg:.5f}°  "
+            f"Dec {self._last_solve_dec_deg:.5f}°\n\n",
+        )
+        try:
+            txt = polar_align_mvp_text(
+                self.site_lat,
+                self.site_lon,
+                self._last_solve_ra_deg,
+                self._last_solve_dec_deg,
+                elev_m=self.site_elev_m,
+            )
+            out.insert(tk.END, txt + "\n")
+        except Exception as exc:
+            out.insert(tk.END, f"Could not compute polar guidance: {exc}\n")
+
+    def _on_polar_align_fov_change(self, val: float) -> None:
+        self._polar_align_fov_deg = float(val)
+        lbl = getattr(self, "_polar_align_fov_label", None)
+        if lbl is not None:
+            lbl.configure(text=f"{self._polar_align_fov_deg:.1f}°")
+        self._redraw_polar_align_plot()
+
+    def _local_sidereal_time_hours(self, longitude_deg: float) -> float:
+        dt = datetime.utcnow()
+        year, month, day = dt.year, dt.month, dt.day
+        hour = dt.hour + dt.minute / 60 + dt.second / 3600
+        if month <= 2:
+            year -= 1
+            month += 12
+        a = math.floor(year / 100)
+        b = 2 - a + math.floor(a / 4)
+        jd = (
+            math.floor(365.25 * (year + 4716))
+            + math.floor(30.6001 * (month + 1))
+            + day
+            + b
+            - 1524.5
+            + hour / 24.0
+        )
+        t = (jd - 2451545.0) / 36525.0
+        gmst = (
+            280.46061837
+            + 360.98564736629 * (jd - 2451545.0)
+            + 0.000387933 * t**2
+            - t**3 / 38710000.0
+        )
+        return ((gmst + longitude_deg) % 360.0) / 15.0
+
+    @staticmethod
+    def _polar_project(ra_hours: float, dec_deg: float, lst_hours: float, pole_sign: int = 1) -> tuple[float, float]:
+        co_lat = 90.0 - pole_sign * dec_deg
+        co_lat_rad = math.radians(co_lat)
+        r = 2.0 * math.tan(co_lat_rad / 2.0)
+        ha_deg = (lst_hours - ra_hours) * 15.0
+        angle = math.pi / 2.0 + pole_sign * math.radians(ha_deg)
+        return (r * math.cos(angle), r * math.sin(angle))
+
+    @staticmethod
+    def _polar_edge_radius(fov_deg: float) -> float:
+        return 2.0 * math.tan(math.radians(fov_deg) / 2.0)
+
+    def _redraw_polar_align_plot(self) -> None:
+        if (
+            not _HAS_MATPLOTLIB
+            or self._polar_align_fig is None
+            or self._polar_align_ax is None
+            or self._polar_align_canvas is None
+            or mpatches is None
+        ):
+            return
+        pal = PLATE_RED_PAL
+        ax = self._polar_align_ax
+        fig = self._polar_align_fig
+        fig.patch.set_facecolor(pal["bg"])
+        ax.clear()
+        ax.set_facecolor("#0d0503")
+        ax.set_aspect("equal")
+        ax.set_xticks([])
+        ax.set_yticks([])
+        for spine in ax.spines.values():
+            spine.set_color(pal["border"])
+        fov_deg = max(0.1, min(10.0, float(getattr(self, "_polar_align_fov_deg", 5.0))))
+        r_edge = self._polar_edge_radius(fov_deg)
+        ax.set_xlim(-r_edge * 1.05, r_edge * 1.05)
+        ax.set_ylim(-r_edge * 1.05, r_edge * 1.05)
+
+        # Match PolarAlignRed look: dense declination rings with periodic labels.
+        dec_step = 1.0
+        for i in range(1, int(fov_deg / dec_step) + 1):
+            co_lat = i * dec_step
+            if co_lat > fov_deg:
+                break
+            r = self._polar_edge_radius(co_lat)
+            major = (i % 2) == 0
+            circle = mpatches.Circle(
+                (0, 0),
+                r,
+                fill=False,
+                edgecolor="#7a3030",
+                linewidth=0.8 if major else 0.45,
+                alpha=0.62 if major else 0.35,
+            )
+            ax.add_patch(circle)
+
+        lst = self._local_sidereal_time_hours(self.site_lon)
+        # RA hour spokes + edge labels (angle markers from original chart style).
+        for h in range(24):
+            hx, hy = self._polar_project(h, 90.0 - fov_deg, lst, pole_sign=1)
+            major = (h % 6) == 0
+            ax.plot(
+                [0, hx],
+                [0, hy],
+                color="#7a3030",
+                linewidth=0.75 if major else 0.4,
+                alpha=0.58 if major else 0.32,
+            )
+            tx, ty = self._polar_project(h, 90.0 - fov_deg * 0.93, lst, pole_sign=1)
+            ax.text(
+                tx,
+                ty,
+                f"{h}h",
+                color=pal["fg"],
+                fontsize=6.3,
+                alpha=0.92,
+                ha="center",
+                va="center",
+                family="monospace",
+            )
+
+        # Ring labels (deg from pole), similar to PolarAlignRed.
+        for deg in (2, 4, 6, 8):
+            if deg > fov_deg:
+                continue
+            lx, ly = self._polar_project(lst, 90.0 - deg, lst, pole_sign=1)
+            ax.text(
+                lx + r_edge * 0.02,
+                ly - r_edge * 0.02,
+                f"{deg:.0f}°",
+                color=pal["fg_dim"],
+                fontsize=6.0,
+                alpha=0.8,
+                family="monospace",
+            )
+
+        polaris_ra_h = 37.95456067 / 15.0
+        polaris_dec = 89.26410897
+        px, py = self._polar_project(polaris_ra_h, polaris_dec, lst, pole_sign=1)
+        ax.plot(px, py, "o", color="#ff7777", markersize=11, alpha=0.25)
+        ax.plot(px, py, "o", color="#ffcccc", markersize=5.5)
+        ax.text(px + r_edge * 0.03, py + r_edge * 0.02, "Polaris", color="#ffcccc", fontsize=8)
+        ax.plot(0, 0, "o", color=pal["fg"], markersize=4)
+        mx, my = self._polar_project(lst, 90.0 - fov_deg, lst, pole_sign=1)
+        ax.plot([0, mx], [0, my], color=pal["accent"], linewidth=1.4, alpha=0.78)
+        ax.text(mx, my + r_edge * 0.02, "Meridian", color=pal["accent"], fontsize=8, ha="center", fontweight="bold")
+        history = getattr(self, "_polar_align_history", [])
+        if history:
+            total = len(history)
+            for i, (hra, hdec) in enumerate(history):
+                hx, hy = self._polar_project(hra / 15.0, hdec, lst, pole_sign=1)
+                if not math.isfinite(hx) or not math.isfinite(hy):
+                    continue
+                alpha = 0.25 + 0.55 * ((i + 1) / max(1, total))
+                size = 2.5 + 1.5 * ((i + 1) / max(1, total))
+                ax.plot(hx, hy, "o", color="#ff7777", markersize=size, alpha=alpha)
+            if len(history) >= 2:
+                xs = []
+                ys = []
+                for hra, hdec in history:
+                    hx, hy = self._polar_project(hra / 15.0, hdec, lst, pole_sign=1)
+                    if math.isfinite(hx) and math.isfinite(hy):
+                        xs.append(hx)
+                        ys.append(hy)
+                if len(xs) >= 2:
+                    ax.plot(xs, ys, color="#ff6666", linewidth=0.9, alpha=0.45)
+        if self._last_solve_ra_deg is not None and self._last_solve_dec_deg is not None:
+            sx, sy = self._polar_project(self._last_solve_ra_deg / 15.0, self._last_solve_dec_deg, lst, pole_sign=1)
+            ax.plot(sx, sy, "o", color="#ff4444", markersize=8, alpha=0.35)
+            ax.plot(sx, sy, "o", color="#ff6666", markersize=4)
+            ax.text(sx + r_edge * 0.03, sy - r_edge * 0.03, "Solved center", color="#ff6666", fontsize=8)
+            ax.plot([sx, 0], [sy, 0], color="#ff6666", linewidth=0.8, alpha=0.7, linestyle="--")
+        try:
+            self._polar_align_canvas.draw_idle()
+        except Exception:
+            pass
 
     # ── Busy indicator + async helpers ─────────────────────────────────────
     def _begin_busy(self, message: str = "Working…"):
@@ -2805,6 +3253,144 @@ class ZWOCameraGUI:
                 break
         self._refresh_session_photos_listbox()
 
+    def _find_solved_fits_for_capture(self, fits_input_path: str) -> str | None:
+        """Find a solved astrometry FITS file generated from a capture FITS."""
+        if not fits_input_path:
+            return None
+        p = Path(fits_input_path)
+        if not p.parent.exists():
+            return None
+        candidates = sorted(p.parent.glob(p.stem + "-astra*.fits"))
+        for cand in candidates:
+            if cand.is_file():
+                return str(cand)
+        return None
+
+    def _generate_session_pdf_report(self):
+        """Build a printable PDF report for the current session captures."""
+        if not self._session_photos:
+            messagebox.showinfo("Session report", "No captures in this session yet.")
+            return
+        if not _HAS_MATPLOTLIB or PdfPages is None:
+            messagebox.showwarning("Session report", "Matplotlib PDF backend is unavailable.")
+            return
+
+        default_name = f"session_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+        save_path = filedialog.asksaveasfilename(
+            title="Save session PDF report",
+            defaultextension=".pdf",
+            initialfile=default_name,
+            filetypes=[("PDF", "*.pdf")],
+        )
+        if not save_path:
+            return
+
+        photos = list(self._session_photos)
+        self.update_status("Building session PDF report...")
+
+        try:
+            with PdfPages(save_path) as pdf:
+                # Cover page
+                fig = plt.figure(figsize=(8.5, 11))
+                fig.patch.set_facecolor("white")
+                fig.text(0.08, 0.93, "ASTRA Session Report", fontsize=22, fontweight="bold")
+                fig.text(0.08, 0.885, f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", fontsize=11)
+                fig.text(0.08, 0.85, f"Site: lat {self.site_lat:.4f}, lon {self.site_lon:.4f}, elev {self.site_elev_m:.0f} m", fontsize=10)
+                fig.text(0.08, 0.82, f"Total captures: {len(photos)}", fontsize=10)
+                fig.text(
+                    0.08,
+                    0.77,
+                    "Includes all captured images.\nPlate-solved captures include ASTRA annotation overlays when available.",
+                    fontsize=10,
+                )
+                plt.axis("off")
+                pdf.savefig(fig, bbox_inches="tight")
+                plt.close(fig)
+
+                page_items = []
+                for idx, rec in enumerate(photos, start=1):
+                    fits_path = rec.get("fits_path", "")
+                    if not fits_path or not os.path.isfile(fits_path):
+                        continue
+
+                    solved_fits = self._find_solved_fits_for_capture(fits_path)
+                    annotated_path = str(Path(fits_path).with_name(Path(fits_path).stem + "-astra-facts.png"))
+                    is_solved = solved_fits is not None
+
+                    if is_solved and not os.path.isfile(annotated_path):
+                        try:
+                            self._annotate_plate_solve_with_offline_facts(
+                                solved_fits_path=solved_fits,
+                                input_image_path=fits_path,
+                                field_center_ra_deg=rec.get("ra_deg"),
+                                field_center_dec_deg=rec.get("dec_deg"),
+                                log_to_plate=False,
+                            )
+                        except Exception:
+                            pass
+
+                    show_path = annotated_path if (is_solved and os.path.isfile(annotated_path)) else fits_path
+                    _gray, img_pil = self._read_image_for_plate_annotations(show_path)
+                    if img_pil is None:
+                        continue
+                    img_arr = np.asarray(img_pil)
+
+                    cap_ts = rec.get("captured_at", "") or "unknown"
+                    header = f"Capture {idx}/{len(photos)}"
+                    details = [f"File: {os.path.basename(fits_path)}", f"Captured: {cap_ts}"]
+                    if rec.get("ra_deg") is not None and rec.get("dec_deg") is not None:
+                        details.append(f"Solved center: RA {rec['ra_deg']:.5f}°  Dec {rec['dec_deg']:.5f}°")
+                    else:
+                        details.append("Solved center: not available")
+                    details.append(
+                        "Annotations: included"
+                        if (is_solved and os.path.isfile(annotated_path))
+                        else ("Annotations: pending" if is_solved else "Annotations: not applicable")
+                    )
+                    page_items.append((img_arr, header, "\n".join(details)))
+
+                for start in range(0, len(page_items), 2):
+                    chunk = page_items[start:start + 2]
+                    fig, axes = plt.subplots(2, 1, figsize=(8.5, 11))
+                    fig.patch.set_facecolor("white")
+                    fig.subplots_adjust(top=0.95, bottom=0.05, left=0.05, right=0.95, hspace=0.32)
+                    if not isinstance(axes, np.ndarray):
+                        axes = np.array([axes])
+                    for i, ax in enumerate(axes):
+                        if i >= len(chunk):
+                            ax.axis("off")
+                            continue
+                        img_arr, header, detail_text = chunk[i]
+                        ax.imshow(img_arr, cmap="gray")
+                        ax.set_axis_off()
+                        y_text = 1.02
+                        ax.text(
+                            0.0,
+                            y_text + 0.06,
+                            header,
+                            transform=ax.transAxes,
+                            fontsize=11,
+                            fontweight="bold",
+                            va="bottom",
+                            ha="left",
+                        )
+                        ax.text(
+                            0.0,
+                            y_text,
+                            detail_text,
+                            transform=ax.transAxes,
+                            fontsize=8.5,
+                            va="bottom",
+                            ha="left",
+                        )
+                    pdf.savefig(fig, bbox_inches="tight")
+                    plt.close(fig)
+
+            self.update_status(f"Session report saved: {save_path}")
+            messagebox.showinfo("Session report", f"PDF report created:\n{save_path}")
+        except Exception as e:
+            messagebox.showerror("Session report", f"Could not generate report:\n{e}")
+
     def _apply_site_from_ui(self):
         try:
             self.site_lat = float(self._site_lat_entry.get().strip())
@@ -2877,6 +3463,7 @@ class ZWOCameraGUI:
         )
         self._sky_log.delete("1.0", tk.END)
         self._sky_log.insert(tk.END, txt + "\n")
+        self._refresh_polar_align_panel()
 
     def _browse_plate_fits(self):
         p = filedialog.askopenfilename(
@@ -2912,11 +3499,10 @@ class ZWOCameraGUI:
                 "(e.g. 05:35:17 or +22:00:52).",
             )
             return
-        if ra is None or dec is None:
+        if (ra is None) != (dec is None):
             messagebox.showwarning(
                 "Plate solve",
-                "Enter RA and Dec hints (decimal degrees or sexagesimal). "
-                "You can use the Resolve, Use mount, or Use last solve buttons.",
+                "Enter both RA and Dec hints, or leave both blank for blind solve.",
             )
             return
 
@@ -2950,24 +3536,44 @@ class ZWOCameraGUI:
             )
             return
 
-        self._plate_out.insert(
-            tk.END,
-            f"Solving with hints: RA {_deg_to_hms(ra)} ({ra:.4f}°)  "
-            f"Dec {_deg_to_dms(dec)} ({dec:.4f}°)  FOV {fov:.3f}°\n"
-            "(multi-pass with auto astrometry setup and PNG fallback; this may take a while)\n",
-        )
+        if ra is not None and dec is not None:
+            self._plate_out.insert(
+                tk.END,
+                f"Solving with hints: RA {_deg_to_hms(ra)} ({ra:.4f}°)  "
+                f"Dec {_deg_to_dms(dec)} ({dec:.4f}°)  FOV {fov:.3f}°\n"
+                "(multi-pass with auto astrometry setup and PNG fallback; this may take a while)\n",
+            )
+        else:
+            self._plate_out.insert(
+                tk.END,
+                f"Blind solving (no RA/Dec hints)  FOV {fov:.3f}°\n"
+                "(this can take longer than hinted solve)\n"
+                "(multi-pass with auto astrometry setup and PNG fallback; this may take a while)\n",
+            )
         self._plate_out.see(tk.END)
+        self._set_plate_solve_busy(True, "Solving...")
 
         def worker():
             base = Path(path).stem + "-astra"
             try:
                 res = run_solve_field_local(path, ra, dec, fov, out_basename=base, timeout=400)
             except Exception as e:
-                self.root.after(0, lambda: self._plate_solve_done(None, str(e)))
+                self.root.after(0, lambda err=str(e): self._plate_solve_done(None, err))
                 return
             self.root.after(0, lambda: self._plate_solve_done(res, None))
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _set_plate_solve_busy(self, busy: bool, msg: str = ""):
+        btn = getattr(self, "_plate_solve_btn", None)
+        status_var = getattr(self, "_plate_solve_status", None)
+        if btn is not None:
+            try:
+                btn.configure(state="disabled" if busy else "normal")
+            except Exception:
+                pass
+        if status_var is not None:
+            status_var.set(f"Status: {msg}" if msg else "Status: Idle")
 
     @staticmethod
     def _recommended_index_filenames(fov_deg: float | None = None):
@@ -3114,6 +3720,7 @@ class ZWOCameraGUI:
         threading.Thread(target=worker, daemon=True).start()
 
     def _plate_solve_done(self, res, err):
+        self._set_plate_solve_busy(False, "Idle")
         if err:
             self._plate_out.insert(tk.END, f"Error: {err}\n")
             return
@@ -3158,17 +3765,303 @@ class ZWOCameraGUI:
                 cra, cdec = read_solved_fits_center_radec_deg(sf)
                 self._last_solve_ra_deg = cra
                 self._last_solve_dec_deg = cdec
+                hist = getattr(self, "_polar_align_history", None)
+                if hist is not None:
+                    hist.append((cra, cdec))
+                    # Keep the most recent solves so the trail stays readable.
+                    if len(hist) > 25:
+                        del hist[:-25]
                 self._plate_out.insert(tk.END, f"Center RA {cra:.5f}°  Dec {cdec:.5f}°\n")
+                self._refresh_polar_align_panel()
                 inp = getattr(self, "_last_plate_solve_input_path", None)
                 if inp:
                     self._update_session_photo_solved(inp, cra, cdec)
             except Exception as e:
                 self._plate_out.insert(tk.END, f"Could not read center from WCS: {e}\n")
+            try:
+                self._annotate_plate_solve_with_offline_facts(
+                    solved_fits_path=sf,
+                    input_image_path=getattr(self, "_last_plate_solve_input_path", None),
+                    field_center_ra_deg=getattr(self, "_last_solve_ra_deg", None),
+                    field_center_dec_deg=getattr(self, "_last_solve_dec_deg", None),
+                )
+            except Exception as e:
+                self._plate_out.insert(tk.END, f"Offline annotation skipped: {e}\n")
         self._plate_out.see(tk.END)
+
+    @staticmethod
+    def _ang_sep_deg(ra1_deg: float, dec1_deg: float, ra2_deg: float, dec2_deg: float) -> float:
+        r1 = math.radians(float(ra1_deg))
+        d1 = math.radians(float(dec1_deg))
+        r2 = math.radians(float(ra2_deg))
+        d2 = math.radians(float(dec2_deg))
+        cos_sep = math.sin(d1) * math.sin(d2) + math.cos(d1) * math.cos(d2) * math.cos(r1 - r2)
+        cos_sep = max(-1.0, min(1.0, cos_sep))
+        return math.degrees(math.acos(cos_sep))
+
+    @staticmethod
+    def _normalize_for_display(arr: np.ndarray) -> np.ndarray:
+        a = np.asarray(arr, dtype=np.float32)
+        finite = np.isfinite(a)
+        if not finite.any():
+            return np.zeros_like(a, dtype=np.uint8)
+        vals = a[finite]
+        lo = float(np.percentile(vals, 1.0))
+        hi = float(np.percentile(vals, 99.5))
+        if hi <= lo:
+            lo = float(vals.min())
+            hi = float(vals.max())
+            if hi <= lo:
+                return np.zeros_like(a, dtype=np.uint8)
+        scaled = np.clip((a - lo) / (hi - lo), 0.0, 1.0)
+        return (scaled * 255.0).astype(np.uint8)
+
+    def _read_image_for_plate_annotations(self, image_path: str) -> tuple[np.ndarray | None, Image.Image | None]:
+        if not image_path:
+            return None, None
+        p = Path(image_path)
+        if not p.is_file():
+            return None, None
+        ext = p.suffix.lower()
+        if ext in (".fits", ".fit", ".fts"):
+            with fits.open(str(p)) as hdul:
+                data = np.asarray(hdul[0].data)
+            if data is None:
+                return None, None
+            if data.ndim > 2:
+                data = np.squeeze(data)
+                if data.ndim > 2:
+                    data = data[0]
+            gray = np.asarray(data, dtype=np.float32)
+            disp8 = self._normalize_for_display(gray)
+            pil = Image.fromarray(disp8, mode="L").convert("RGB")
+            return gray, pil
+        gray = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE)
+        if gray is None:
+            return None, None
+        pil = Image.fromarray(gray).convert("RGB")
+        return np.asarray(gray, dtype=np.float32), pil
+
+    @staticmethod
+    def _identify_star_from_offline_catalog(ra_deg: float, dec_deg: float) -> tuple[str, str, str]:
+        nearest = None
+        best_sep = float("inf")
+        for row in OFFLINE_STAR_FACTS:
+            sep = ZWOCameraGUI._ang_sep_deg(ra_deg, dec_deg, row["ra_deg"], row["dec_deg"])
+            if sep < best_sep:
+                best_sep = sep
+                nearest = row
+        # Curated facts: generous radius for coarse plate solutions vs. catalog positions.
+        if nearest is not None and best_sep <= 0.55:
+            return str(nearest["name"]), str(nearest["fact"]), str(nearest["source"])
+        tycho = tycho_nearest_identification(ra_deg, dec_deg, max_sep_deg=0.11)
+        if tycho is not None:
+            return tycho[0], tycho[1], tycho[2]
+        if nearest is not None and best_sep <= 1.0:
+            return str(nearest["name"]), str(nearest["fact"]), str(nearest["source"])
+        return "Unidentified field star", "No match in offline bright-star list or Tycho-2 within search radius.", "Unknown"
+
+    def _extract_largest_star_sources(
+        self, img_gray: np.ndarray, solved_wcs: WCS
+    ) -> list[dict]:
+        if img_gray is None or solved_wcs is None:
+            return []
+        data = np.asarray(img_gray, dtype=np.float32)
+        if data.ndim != 2 or data.size == 0:
+            return []
+        try:
+            bkg = sep.Background(data)
+            data_sub = data - bkg
+            thresh = max(2.5, 3.0 * float(bkg.globalrms))
+            sources = sep.extract(data_sub, thresh)
+        except Exception:
+            return []
+        if sources is None or len(sources) == 0:
+            return []
+        rows = sorted(
+            [s for s in sources if np.isfinite(s["x"]) and np.isfinite(s["y"])],
+            key=lambda s: (float(s["npix"]), float(s["flux"])),
+            reverse=True,
+        )
+        picked = []
+        for s in rows:
+            if len(picked) >= 2:
+                break
+            x = float(s["x"])
+            y = float(s["y"])
+            try:
+                ra_deg, dec_deg = solved_wcs.all_pix2world(x, y, 0)
+            except Exception:
+                continue
+            star_name, fact, source = self._identify_star_from_offline_catalog(float(ra_deg), float(dec_deg))
+            picked.append(
+                {
+                    "x": x,
+                    "y": y,
+                    "area_px": float(s["npix"]),
+                    "flux": float(s["flux"]),
+                    "ra_deg": float(ra_deg),
+                    "dec_deg": float(dec_deg),
+                    "name": star_name,
+                    "fact": fact,
+                    "catalog_source": source,
+                }
+            )
+        return picked
+
+    def _moon_region_fact_if_present(
+        self,
+        field_center_ra_deg: float | None,
+        field_center_dec_deg: float | None,
+        image_shape: tuple[int, int] | None,
+    ) -> tuple[str, str] | None:
+        if field_center_ra_deg is None or field_center_dec_deg is None:
+            return None
+        if not image_shape or image_shape[0] <= 0 or image_shape[1] <= 0:
+            return None
+        try:
+            from sky_ephemeris import body_apparent_radec_deg
+        except Exception:
+            return None
+        try:
+            moon_ra, moon_dec = body_apparent_radec_deg(
+                SOLAR_SYSTEM_BODIES["Moon"], self.site_lat, self.site_lon, self.site_elev_m
+            )
+        except Exception:
+            return None
+        sep_deg = self._ang_sep_deg(field_center_ra_deg, field_center_dec_deg, moon_ra, moon_dec)
+        try:
+            fov_long = float(self._plate_fov.get().strip())
+        except Exception:
+            fov_long = 0.0
+        if fov_long <= 0:
+            return None
+        h_px, w_px = float(image_shape[0]), float(image_shape[1])
+        if w_px <= 0 or h_px <= 0:
+            return None
+        if w_px >= h_px:
+            fov_w, fov_h = fov_long, fov_long * (h_px / w_px)
+        else:
+            fov_h, fov_w = fov_long, fov_long * (w_px / h_px)
+        frame_diag_half_deg = 0.5 * math.hypot(fov_w, fov_h)
+        moon_radius_deg = 0.26
+        if sep_deg > frame_diag_half_deg + moon_radius_deg:
+            return None
+
+        dra = (field_center_ra_deg - moon_ra) * math.cos(math.radians(moon_dec))
+        ddec = field_center_dec_deg - moon_dec
+        if sep_deg < moon_radius_deg * 0.35:
+            key = "near_side_center"
+            region = "near-side central maria"
+        elif abs(dra) >= abs(ddec):
+            if dra >= 0:
+                key = "east_limb"
+                region = "eastern lunar limb"
+            else:
+                key = "west_limb"
+                region = "western lunar limb"
+        else:
+            if ddec >= 0:
+                key = "north_limb"
+                region = "northern lunar region"
+            else:
+                key = "south_limb"
+                region = "southern lunar region"
+        return region, OFFLINE_MOON_REGION_FACTS.get(key, "")
+
+    def _annotate_plate_solve_with_offline_facts(
+        self,
+        solved_fits_path: str,
+        input_image_path: str | None,
+        field_center_ra_deg: float | None,
+        field_center_dec_deg: float | None,
+        log_to_plate: bool = True,
+    ):
+        if not solved_fits_path or not os.path.isfile(solved_fits_path):
+            return
+        with fits.open(solved_fits_path) as hdul:
+            solved_wcs = WCS(hdul[0].header)
+
+        img_gray, img_pil = self._read_image_for_plate_annotations(input_image_path or "")
+        if img_gray is None or img_pil is None:
+            if log_to_plate and getattr(self, "_plate_out", None):
+                self._plate_out.insert(
+                    tk.END,
+                    "Offline annotations: could not load the original image for overlay rendering.\n",
+                )
+            return
+
+        stars = self._extract_largest_star_sources(img_gray, solved_wcs)
+        draw = ImageDraw.Draw(img_pil)
+        for idx, star in enumerate(stars, start=1):
+            x, y = float(star["x"]), float(star["y"])
+            r = 14 if idx == 1 else 11
+            color = (255, 92, 92) if idx == 1 else (255, 180, 120)
+            draw.ellipse((x - r, y - r, x + r, y + r), outline=color, width=2)
+            lbl = f"{idx}) {star['name']}"
+            draw.text((x + r + 3, y - 10), lbl, fill=color)
+            if log_to_plate and getattr(self, "_plate_out", None):
+                self._plate_out.insert(
+                    tk.END,
+                    f"Star {idx}: {star['name']}  RA {star['ra_deg']:.5f}°  Dec {star['dec_deg']:.5f}°\n"
+                    f"  Fact: {star['fact']}\n"
+                    f"  Catalog: {star['catalog_source']}\n",
+                )
+        if not stars:
+            if log_to_plate and getattr(self, "_plate_out", None):
+                self._plate_out.insert(
+                    tk.END,
+                    "Offline annotations: no reliable stellar sources found for top-2 star facts.\n",
+                )
+
+        moon_info = self._moon_region_fact_if_present(
+            field_center_ra_deg=field_center_ra_deg,
+            field_center_dec_deg=field_center_dec_deg,
+            image_shape=img_gray.shape[:2],
+        )
+        if moon_info:
+            moon_region, moon_fact = moon_info
+            draw.text((12, 12), f"Moon: {moon_region}", fill=(150, 220, 255))
+            if log_to_plate and getattr(self, "_plate_out", None):
+                self._plate_out.insert(
+                    tk.END,
+                    f"Moon region in frame: {moon_region}\n"
+                    f"  Fact: {moon_fact}\n"
+                    "  Catalog: regional lunar geology fact set (offline)\n",
+                )
+
+        base_path = Path(input_image_path) if input_image_path else Path(solved_fits_path)
+        out_path = base_path.with_name(base_path.stem + "-astra-facts.png")
+        try:
+            img_pil.save(str(out_path))
+            if log_to_plate and getattr(self, "_plate_out", None):
+                self._plate_out.insert(tk.END, f"Annotated image saved: {out_path}\n")
+                self._plate_out.insert(
+                    tk.END,
+                    "Offline data sources used: expanded bright-star fact list, Tycho-2 nearest match fallback, and local lunar region facts.\n",
+                )
+        except Exception as e:
+            if log_to_plate and getattr(self, "_plate_out", None):
+                self._plate_out.insert(tk.END, f"Could not save annotation image: {e}\n")
 
     def apply_theme(self):
         """Apply the current theme to all UI elements"""
         t = self.theme
+
+        def _descendant_ctk_buttons(root_widget):
+            found = []
+            stack = [root_widget]
+            while stack:
+                w = stack.pop()
+                try:
+                    kids = w.winfo_children()
+                except Exception:
+                    kids = []
+                for child in kids:
+                    stack.append(child)
+                    if isinstance(child, ctk.CTkButton):
+                        found.append(child)
+            return found
 
         # Root and main containers
         self.root.configure(bg=t["bg_primary"])
@@ -3256,14 +4149,8 @@ class ZWOCameraGUI:
             pass
 
         # Update CTkButtons
-        action_buttons = [self.start_preview_btn, self.capture_img_btn, self.record_video_btn]
-        fs = getattr(self, "_focus_start_btn", None)
-        if fs is not None:
-            action_buttons.append(fs)
+        action_buttons = [self.capture_img_btn, self.record_video_btn]
         small_buttons = [self.connect_btn, self.refresh_btn, self.browse_btn]
-        for fb in (getattr(self, "_focus_arm_btn", None), getattr(self, "_focus_cancel_btn", None), getattr(self, "_focus_restore_btn", None)):
-            if fb is not None:
-                small_buttons.append(fb)
 
         btn_text_color = "#fccfcf" if self.night_mode else "white"
         for btn in action_buttons:
@@ -3277,6 +4164,31 @@ class ZWOCameraGUI:
                 border_color=t["border"],
                 border_width=1
             )
+
+        # Keep Session photos and Site/Sky action buttons red in night mode.
+        try:
+            tab_buttons = []
+            for tab_name in ("Session photos", "Site / Sky"):
+                tab_buttons.extend(_descendant_ctk_buttons(self._center_tabs.tab(tab_name)))
+            for btn in tab_buttons:
+                if self.night_mode:
+                    btn.configure(
+                        fg_color=t["accent"],
+                        hover_color=t["accent_light"],
+                        text_color="#fccfcf",
+                        border_color=t["border"],
+                        border_width=1,
+                    )
+                else:
+                    btn.configure(
+                        fg_color=t["bg_secondary"],
+                        hover_color=t["bg_tertiary"],
+                        text_color=t["fg_primary"],
+                        border_color=t["border"],
+                        border_width=1,
+                    )
+        except Exception:
+            pass
 
         # Path entry
         self.path_entry.configure(
@@ -3326,6 +4238,45 @@ class ZWOCameraGUI:
         except Exception:
             pass
 
+        # Focus assistant tab styling: keep the embedded plot, labels, and
+        # listbox legible in both day and night modes. The capture/reset
+        # buttons stay on the permanent red palette regardless of theme so the
+        # observer keeps dark adaptation while focusing at the eyepiece.
+        try:
+            red_pal = PLATE_RED_PAL
+            cap_btn = getattr(self, "focus_capture_btn", None)
+            if cap_btn is not None:
+                cap_btn.configure(
+                    fg_color=red_pal["accent"],
+                    hover_color=red_pal["accent_hover"],
+                    text_color=red_pal["btn_text"],
+                )
+            reset_btn = getattr(self, "focus_reset_btn", None)
+            if reset_btn is not None:
+                reset_btn.configure(
+                    fg_color=red_pal["accent_dim"],
+                    hover_color=red_pal["accent"],
+                    text_color=red_pal["btn_text"],
+                )
+            focus_lb = getattr(self, "focus_listbox", None)
+            if focus_lb is not None:
+                lb_bg = t["canvas_bg"] if not self.night_mode else t["bg_tertiary"]
+                focus_lb.configure(
+                    bg=lb_bg,
+                    fg=t["fg_primary"],
+                    selectbackground=t["accent"],
+                    selectforeground=("white" if not self.night_mode else t["bg_primary"]),
+                    highlightbackground=t["border"],
+                )
+            for lbl_attr in ("focus_status_label", "focus_best_label"):
+                lbl = getattr(self, lbl_attr, None)
+                if lbl is not None:
+                    lbl.configure(bg=t["bg_primary"], fg=t["fg_primary"])
+            if getattr(self, "_focus_canvas", None) is not None:
+                self._focus_redraw_plot()
+        except Exception:
+            pass
+
         is_live = getattr(self, "_livewcs_active", False)
         signal_color = t["accent"] if is_live else t["fg_tertiary"]
         signal_text = "Sky target" if is_live else "No sky target"
@@ -3338,6 +4289,37 @@ class ZWOCameraGUI:
             self.theme_btn.configure(fg_color=t["accent"], text_color="white", hover_color=t["accent_light"])
         else:
             self.theme_btn.configure(fg_color=t["bg_tertiary"], text_color=t["fg_primary"], hover_color=t["accent"])
+        try:
+            pal = PLATE_RED_PAL
+            if self._polar_align_mode:
+                self.polar_align_mode_btn.configure(
+                    fg_color=pal["accent"],
+                    hover_color=pal["accent_hover"],
+                    text_color=pal["btn_text"],
+                    text="Motor Control",
+                )
+            else:
+                self.polar_align_mode_btn.configure(
+                    fg_color=pal["accent_dim"],
+                    hover_color=pal["accent"],
+                    text_color=pal["btn_text"],
+                    text="Polar Align Mode",
+                )
+            if self._polar_align_panel is not None:
+                self._polar_align_panel.configure(
+                    fg_color=pal["bg"],
+                    border_color=pal["border"],
+                )
+            if self._polar_align_text is not None:
+                self._polar_align_text.configure(
+                    bg=pal["bg_alt"],
+                    fg=pal["fg"],
+                    insertbackground=pal["fg"],
+                    highlightbackground=pal["border"],
+                    highlightcolor=pal["accent"],
+                )
+        except Exception:
+            pass
 
         combo_settings = {
             "fg_color": t["bg_secondary"] if self.night_mode else "white",
@@ -3349,7 +4331,6 @@ class ZWOCameraGUI:
             "dropdown_hover_color": t["bg_secondary"] if self.night_mode else "#f0f0f0"
         }
 
-        focus_combo = getattr(self, "_focus_fn_menu", None)
         combo_list = [
             self.camera_dropdown,
             self.binning_dropdown,
@@ -3358,8 +4339,6 @@ class ZWOCameraGUI:
             self.exposure_range_dropdown,
             self.frame_type_dropdown,
         ]
-        if focus_combo is not None:
-            combo_list.append(focus_combo)
         for combo in combo_list:
             combo.configure(**combo_settings)
 
@@ -3378,22 +4357,6 @@ class ZWOCameraGUI:
             "text_color": t["fg_primary"],
             "border_color": t["border"],
         }
-        for wname in ("_focus_settle_entry", "_focus_turns_entry"):
-            w = getattr(self, wname, None)
-            if w is not None:
-                try:
-                    w.configure(**entry_settings)
-                except Exception:
-                    pass
-
-        tb_bg = t["canvas_bg"] if not self.night_mode else t["bg_tertiary"]
-        fr = getattr(self, "_focus_results", None)
-        if fr is not None:
-            try:
-                fr.configure(fg_color=tb_bg, text_color=t["fg_primary"], border_color=t["border"])
-            except Exception:
-                pass
-
         mp = getattr(self, "mount_panel", None)
         if mp is not None:
             try:
@@ -3523,7 +4486,6 @@ class ZWOCameraGUI:
                 self.camera_dropdown.configure(values=["No cameras detected"])
                 self.camera_dropdown.set("No cameras detected")
                 self.update_status("No cameras found")
-            self._focus_update_start_enabled()
 
         def fail(exc):
             messagebox.showerror("Error", f"Failed to refresh cameras: {exc}")
@@ -3575,7 +4537,7 @@ class ZWOCameraGUI:
                 pass
             self.update_status(f"Connected to {info['Name']}")
             messagebox.showinfo("Success", f"Connected to {info['Name']}")
-            self._focus_update_start_enabled()
+            self.start_preview()
 
         def fail(exc):
             self.camera = None
@@ -3586,7 +4548,6 @@ class ZWOCameraGUI:
                 pass
             messagebox.showerror("Error", f"Failed to connect to camera: {exc}")
             self.update_status("Failed to connect to camera")
-            self._focus_update_start_enabled()
 
         self._run_async(work, busy_message="Connecting to camera…", on_done=done, on_error=fail)
 
@@ -3726,13 +4687,524 @@ class ZWOCameraGUI:
             self.path_entry.configure(state="readonly")
             self._save_site_settings()
 
-    def toggle_preview(self):
-        if not self.is_capturing:
-            self.start_preview()
-            self.start_preview_btn.configure(text="Stop Preview")
+    # ---------------------------------------------------------------- Focus tab
+    def _build_focus_tab(self, parent):
+        """Focus assistant: step a manual focuser through positions and find the best.
+
+        Workflow expected by the user: aim at an isolated bright star, turn the
+        focus knob a small amount, click "Capture sample", and hold still while
+        the GUI waits a settle delay (default 3 s) for the telescope to stop
+        shaking. The latest preview frame after the settle is then scored using
+        the Half-Flux Radius of detected stars (lower is sharper). The plot and
+        sample list highlight the best-focus sample so the observer can return
+        the focuser to that position.
+        """
+        intro = tk.Label(
+            parent,
+            text=(
+                "Aim at an isolated bright star with the live preview running."
+            ),
+            font=("Segoe UI", 9),
+            wraplength=240,
+            justify=tk.LEFT,
+        )
+        intro.pack(anchor="w", pady=(0, 4))
+        steps = tk.Label(
+            parent,
+            text=(
+                "1) Turn the focus knob a small amount.\n"
+                "2) Click Capture sample, then keep hands off.\n"
+                "3) Repeat across the focus range — the plot and list mark the\n"
+                "   sharpest sample as BEST so you can return to it."
+            ),
+            font=("Segoe UI", 9, "italic"),
+            wraplength=240,
+            justify=tk.LEFT,
+        )
+        steps.pack(anchor="w", pady=(0, 8))
+
+        # Settle seconds entry
+        settle_row = tk.Frame(parent)
+        settle_row.pack(fill=tk.X, pady=(2, 4))
+        tk.Label(settle_row, text="Settle (s):", font=("Segoe UI", 9)).pack(side=tk.LEFT)
+        self.focus_settle_var = tk.DoubleVar(value=3.0)
+        self.focus_settle_entry = ctk.CTkEntry(
+            settle_row,
+            textvariable=self.focus_settle_var,
+            width=70,
+            height=26,
+            fg_color="white",
+            text_color="#1a1a1a",
+            border_color="#cccccc",
+            border_width=1,
+            corner_radius=6,
+        )
+        self.focus_settle_entry.pack(side=tk.LEFT, padx=(6, 0))
+        tk.Label(
+            settle_row,
+            text="(wait for vibration to die)",
+            font=("Segoe UI", 8, "italic"),
+        ).pack(side=tk.LEFT, padx=(6, 0))
+
+        # Position label entry (free-form: turn count, focuser microns, etc.)
+        pos_row = tk.Frame(parent)
+        pos_row.pack(fill=tk.X, pady=(2, 4))
+        tk.Label(pos_row, text="Position:", font=("Segoe UI", 9)).pack(side=tk.LEFT)
+        self.focus_pos_var = tk.StringVar(value="")
+        self.focus_pos_entry = ctk.CTkEntry(
+            pos_row,
+            textvariable=self.focus_pos_var,
+            height=26,
+            fg_color="white",
+            text_color="#1a1a1a",
+            placeholder_text_color="#999999",
+            border_color="#cccccc",
+            border_width=1,
+            corner_radius=6,
+            placeholder_text="optional knob/turn label",
+        )
+        self.focus_pos_entry.pack(side=tk.LEFT, padx=(6, 0), fill=tk.X, expand=True)
+
+        # Capture sample (primary) + reset run buttons. Red palette so the
+        # focus controls stay dark-adapted at the eyepiece.
+        red_pal = PLATE_RED_PAL
+        self.focus_capture_btn = ctk.CTkButton(
+            parent,
+            text="Capture sample",
+            command=self._focus_capture_sample,
+            font=("Segoe UI", 10, "bold"),
+            height=36,
+            fg_color=red_pal["accent"],
+            text_color=red_pal["btn_text"],
+            hover_color=red_pal["accent_hover"],
+            corner_radius=6,
+        )
+        self.focus_capture_btn.pack(fill=tk.X, pady=(8, 4))
+
+        self.focus_reset_btn = ctk.CTkButton(
+            parent,
+            text="Reset run",
+            command=self._focus_reset_run,
+            font=("Segoe UI", 9),
+            height=28,
+            fg_color=red_pal["accent_dim"],
+            text_color=red_pal["btn_text"],
+            hover_color=red_pal["accent"],
+            corner_radius=6,
+        )
+        self.focus_reset_btn.pack(fill=tk.X, pady=(0, 8))
+
+        self.focus_status_label = tk.Label(
+            parent,
+            text="No samples yet. Connect the camera and start the live preview.",
+            font=("Segoe UI", 9, "italic"),
+            wraplength=240,
+            justify=tk.LEFT,
+            anchor=tk.W,
+        )
+        self.focus_status_label.pack(fill=tk.X, pady=(0, 4))
+
+        self.focus_best_label = tk.Label(
+            parent,
+            text="Best focus: \u2014",
+            font=("Segoe UI", 10, "bold"),
+            wraplength=240,
+            justify=tk.LEFT,
+            anchor=tk.W,
+        )
+        self.focus_best_label.pack(fill=tk.X, pady=(0, 6))
+
+        # Embedded matplotlib plot of focus score per sample
+        plot_frame = tk.Frame(parent)
+        plot_frame.pack(fill=tk.X, pady=(0, 6))
+        if _HAS_MATPLOTLIB:
+            self._focus_fig, self._focus_ax = plt.subplots(figsize=(2.8, 2.0), dpi=100)
+            self._focus_fig.subplots_adjust(left=0.22, right=0.96, top=0.90, bottom=0.24)
+            self._focus_canvas = FigureCanvasTkAgg(self._focus_fig, master=plot_frame)
+            self._focus_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
         else:
-            self.stop_preview()
-            self.start_preview_btn.configure(text="Start Preview")
+            self._focus_fig = None
+            self._focus_ax = None
+            self._focus_canvas = None
+            tk.Label(
+                plot_frame,
+                text="(install matplotlib to see the focus plot)",
+                font=("Segoe UI", 9, "italic"),
+            ).pack(fill=tk.X, padx=4, pady=4)
+
+        tk.Label(parent, text="Samples:", font=("Segoe UI", 9, "bold")).pack(
+            anchor="w", pady=(4, 2)
+        )
+        list_frame = tk.Frame(parent)
+        list_frame.pack(fill=tk.BOTH, expand=True)
+        sb = tk.Scrollbar(list_frame, orient=tk.VERTICAL)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.focus_listbox = tk.Listbox(
+            list_frame,
+            height=5,
+            font=("Courier New", 9),
+            yscrollcommand=sb.set,
+            activestyle="none",
+            relief=tk.FLAT,
+            highlightthickness=1,
+            exportselection=False,
+        )
+        self.focus_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb.config(command=self.focus_listbox.yview)
+
+        self._focus_redraw_plot()
+        self._focus_refresh_table()
+
+    def _focus_capture_sample(self):
+        """Begin a single focus sample: settle wait, then score the next preview frame."""
+        if self._focus_run_busy:
+            return
+        if not self.camera or not self.camera_initialized:
+            messagebox.showwarning("Focus", "Please connect to a camera first.")
+            return
+        # Need preview running so frames stream into the cache.
+        if not self.is_capturing:
+            try:
+                self.start_preview()
+            except Exception as exc:
+                messagebox.showerror("Focus", f"Could not start preview: {exc}")
+                return
+            if not self.is_capturing:
+                return
+        try:
+            settle_s = float(self.focus_settle_var.get())
+        except Exception:
+            settle_s = 3.0
+        # Clamp to a sane range so a stray entry can't hang the GUI for minutes.
+        settle_s = max(0.0, min(30.0, settle_s))
+
+        self._focus_run_busy = True
+        try:
+            self.focus_capture_btn.configure(state="disabled")
+        except Exception:
+            pass
+
+        # Pull the user-typed position label here on the main thread; default to
+        # an auto-incrementing "#N" if the field is empty so the worker never
+        # needs to touch Tk variables.
+        user_pos = self.focus_pos_var.get().strip()
+        sample_idx = len(self._focus_samples) + 1
+        position_label = user_pos if user_pos else f"#{sample_idx}"
+
+        threading.Thread(
+            target=self._focus_settle_worker,
+            kwargs={
+                "settle_s": settle_s,
+                "sample_idx": sample_idx,
+                "position_label": position_label,
+            },
+            daemon=True,
+        ).start()
+
+    def _focus_settle_worker(self, *, settle_s: float, sample_idx: int, position_label: str):
+        try:
+            deadline = time.time() + settle_s
+            # Countdown banner
+            while True:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    break
+                secs_left = int(math.ceil(remaining))
+                self.root.after(
+                    0,
+                    lambda s=secs_left: self.focus_status_label.configure(
+                        text=f"Settling… {s}s remaining (keep hands off)."
+                    ),
+                )
+                time.sleep(min(0.25, max(0.05, remaining)))
+            self.root.after(
+                0,
+                lambda: self.focus_status_label.configure(text="Measuring sample…"),
+            )
+
+            # Wait for a frame whose timestamp is at or past the settle deadline
+            # so we score the post-shake state instead of a stale frame.
+            try:
+                exposure_s = float(self._get_exposure_seconds())
+            except Exception:
+                exposure_s = 0.0
+            frame_wait_s = max(6.0, 2.0 * exposure_s + 2.0)
+            timeout_at = time.time() + frame_wait_s
+            frame_rgb = None
+            while time.time() < timeout_at:
+                ts = float(self._latest_preview_full_ts or 0.0)
+                arr = self._latest_preview_full_rgb
+                if arr is not None and ts >= deadline:
+                    frame_rgb = arr
+                    break
+                time.sleep(0.05)
+            if frame_rgb is None:
+                # Fall back to whatever is most recent rather than dropping the click.
+                frame_rgb = self._latest_preview_full_rgb
+            if frame_rgb is None:
+                self.root.after(
+                    0,
+                    lambda: self.focus_status_label.configure(
+                        text="No preview frame available. Start the live preview and aim at a star."
+                    ),
+                )
+                return
+
+            score, kind, n_stars, raw_value = self._focus_compute_score(frame_rgb)
+            sample = {
+                "index": sample_idx,
+                "position": position_label,
+                "score": float(score),
+                "kind": kind,
+                "n_stars": int(n_stars),
+                "raw": float(raw_value),
+                "captured_at": datetime.now().isoformat(timespec="seconds"),
+            }
+            self._focus_samples.append(sample)
+            self.root.after(0, self._focus_finalize_sample, sample)
+        except Exception as exc:
+            err_msg = f"Focus error: {exc}"
+            self.root.after(
+                0, lambda m=err_msg: self.focus_status_label.configure(text=m)
+            )
+        finally:
+            self.root.after(0, self._focus_finish_busy)
+
+    def _focus_finalize_sample(self, sample: dict):
+        self._focus_redraw_plot()
+        self._focus_refresh_table()
+        self._update_best_focus_label()
+        kind = sample.get("kind", "laplacian")
+        if kind == "hfr":
+            msg = (
+                f"Sample {sample['position']} \u2192 HFR {sample['raw']:.2f} px "
+                f"({sample['n_stars']} star{'s' if sample['n_stars'] != 1 else ''}). "
+                f"Lower is sharper."
+            )
+        else:
+            msg = (
+                f"Sample {sample['position']} \u2192 sharpness {sample['raw']:.0f} "
+                f"(no stars detected; using Laplacian fallback)."
+            )
+        self.focus_status_label.configure(text=msg)
+
+    def _focus_finish_busy(self):
+        self._focus_run_busy = False
+        try:
+            self.focus_capture_btn.configure(state="normal")
+        except Exception:
+            pass
+
+    def _focus_reset_run(self):
+        if self._focus_run_busy:
+            return
+        self._focus_samples = []
+        self._focus_redraw_plot()
+        self._focus_refresh_table()
+        self._update_best_focus_label()
+        try:
+            self.focus_status_label.configure(
+                text="Run reset. Turn the focuser, then capture a sample."
+            )
+        except Exception:
+            pass
+
+    def _focus_compute_score(self, frame_rgb: np.ndarray):
+        """Score a frame's focus quality.
+
+        Returns ``(score, kind, n_stars, raw)`` where ``score`` is always
+        higher-is-sharper (used for ranking), ``kind`` is ``"hfr"`` if a
+        star-based metric was available or ``"laplacian"`` for the fallback,
+        ``n_stars`` is the number of stars used for HFR, and ``raw`` is the
+        primary value to display: HFR in pixels (lower better) when ``kind``
+        is ``"hfr"``, or the Laplacian variance otherwise.
+        """
+        arr = np.asarray(frame_rgb)
+        if arr.ndim == 3 and arr.shape[2] >= 3:
+            gray = (
+                0.299 * arr[..., 0].astype(np.float32)
+                + 0.587 * arr[..., 1].astype(np.float32)
+                + 0.114 * arr[..., 2].astype(np.float32)
+            )
+        else:
+            gray = arr.astype(np.float32)
+
+        # Primary metric: median half-flux radius of the brightest detected stars.
+        try:
+            data = np.ascontiguousarray(gray, dtype=np.float32)
+            bkg = sep.Background(data)
+            data_sub = data - bkg
+            thresh_val = max(2.5, 4.0 * float(bkg.globalrms))
+            sources = sep.extract(data_sub, thresh_val, minarea=5)
+            if sources is not None and len(sources) > 0:
+                sorted_sources = sorted(
+                    sources, key=lambda s: float(s["flux"]), reverse=True
+                )
+                top = sorted_sources[: min(10, len(sorted_sources))]
+                xs = np.array([float(s["x"]) for s in top])
+                ys = np.array([float(s["y"]) for s in top])
+                a_vals = np.array([float(s["a"]) for s in top])
+                # Cap aperture to the minimum of image half-extent so flux_radius
+                # never asks for samples outside the array.
+                h, w = data_sub.shape
+                max_aperture = max(8.0, 0.45 * min(h, w))
+                r_apertures = np.clip(6.0 * a_vals, 12.0, max_aperture)
+                try:
+                    radii, _flags = sep.flux_radius(
+                        data_sub, xs, ys, r_apertures, 0.5
+                    )
+                except Exception:
+                    radii = None
+                if radii is not None:
+                    radii_arr = np.asarray(radii, dtype=np.float64)
+                    ok = np.isfinite(radii_arr) & (radii_arr > 0)
+                    if np.any(ok):
+                        hfr = float(np.median(radii_arr[ok]))
+                        score = 1.0 / max(hfr, 1e-3)
+                        return score, "hfr", int(np.sum(ok)), hfr
+        except Exception:
+            pass
+
+        # Fallback metric: Laplacian variance — works on any structured frame,
+        # but values are not directly comparable to HFR-based runs.
+        try:
+            lap_var = float(cv2.Laplacian(gray, cv2.CV_32F).var())
+            return lap_var, "laplacian", 0, lap_var
+        except Exception:
+            return 0.0, "laplacian", 0, 0.0
+
+    def _best_sample_index(self) -> int | None:
+        if not self._focus_samples:
+            return None
+        hfr_indices = [
+            i for i, s in enumerate(self._focus_samples) if s.get("kind") == "hfr"
+        ]
+        if hfr_indices:
+            return min(hfr_indices, key=lambda i: self._focus_samples[i]["raw"])
+        return max(
+            range(len(self._focus_samples)),
+            key=lambda i: self._focus_samples[i].get("score", 0.0),
+        )
+
+    def _focus_redraw_plot(self) -> None:
+        ax = getattr(self, "_focus_ax", None)
+        canvas = getattr(self, "_focus_canvas", None)
+        fig = getattr(self, "_focus_fig", None)
+        if ax is None or canvas is None or fig is None:
+            return
+        t = self.theme
+        bg = t["bg_secondary"]
+        fg = t["fg_primary"]
+        grid = t["fg_tertiary"]
+        accent = t["accent"]
+        try:
+            fig.patch.set_facecolor(bg)
+            ax.clear()
+            ax.set_facecolor(bg)
+            ax.tick_params(colors=fg, labelsize=8)
+            for spine in ax.spines.values():
+                spine.set_color(grid)
+            ax.set_xlabel("Sample #", color=fg, fontsize=9)
+
+            samples = self._focus_samples
+            if not samples:
+                ax.text(
+                    0.5,
+                    0.5,
+                    "no samples yet",
+                    ha="center",
+                    va="center",
+                    color=grid,
+                    fontsize=9,
+                    transform=ax.transAxes,
+                )
+                ax.set_xticks([])
+                ax.set_yticks([])
+                canvas.draw_idle()
+                return
+
+            has_hfr = any(s.get("kind") == "hfr" for s in samples)
+            if has_hfr:
+                ax.set_ylabel("HFR (px) — lower better", color=fg, fontsize=9)
+                plot_samples = [s for s in samples if s.get("kind") == "hfr"]
+            else:
+                ax.set_ylabel("Sharpness — higher better", color=fg, fontsize=9)
+                plot_samples = list(samples)
+
+            xs = [s["index"] for s in plot_samples]
+            ys = [s["raw"] for s in plot_samples]
+            ax.plot(
+                xs,
+                ys,
+                color=accent,
+                marker="o",
+                markersize=4,
+                linewidth=1.4,
+            )
+            best_idx = self._best_sample_index()
+            if best_idx is not None and 0 <= best_idx < len(samples):
+                best = samples[best_idx]
+                if (has_hfr and best.get("kind") == "hfr") or not has_hfr:
+                    ax.plot(
+                        [best["index"]],
+                        [best["raw"]],
+                        marker="*",
+                        markersize=14,
+                        color=accent,
+                        markeredgecolor=fg,
+                        markeredgewidth=1.0,
+                        linestyle="None",
+                    )
+            ax.grid(color=grid, alpha=0.3, linestyle="--", linewidth=0.6)
+            canvas.draw_idle()
+        except Exception:
+            pass
+
+    def _focus_refresh_table(self) -> None:
+        lb = getattr(self, "focus_listbox", None)
+        if lb is None:
+            return
+        try:
+            lb.delete(0, tk.END)
+        except tk.TclError:
+            return
+        best_idx = self._best_sample_index()
+        for i, s in enumerate(self._focus_samples):
+            position = str(s.get("position", f"#{s.get('index', i + 1)}"))
+            kind = s.get("kind", "laplacian")
+            if kind == "hfr":
+                value_txt = f"HFR {s['raw']:5.2f} px ({s['n_stars']} stars)"
+            else:
+                value_txt = f"sharp {s['raw']:7.0f}"
+            marker = "  *BEST*" if i == best_idx else ""
+            line = f"{s['index']:>3}  {position:<10.10}  {value_txt}{marker}"
+            lb.insert(tk.END, line)
+        if best_idx is not None:
+            try:
+                lb.selection_clear(0, tk.END)
+                lb.selection_set(best_idx)
+                lb.see(best_idx)
+            except tk.TclError:
+                pass
+
+    def _update_best_focus_label(self) -> None:
+        lbl = getattr(self, "focus_best_label", None)
+        if lbl is None:
+            return
+        best_idx = self._best_sample_index()
+        if best_idx is None:
+            lbl.configure(text="Best focus: \u2014")
+            return
+        s = self._focus_samples[best_idx]
+        if s.get("kind") == "hfr":
+            txt = (
+                f"Best focus: sample {s['position']} — HFR {s['raw']:.2f} px"
+            )
+        else:
+            txt = (
+                f"Best focus: sample {s['position']} — sharpness {s['raw']:.0f}"
+            )
+        lbl.configure(text=txt)
 
     def start_preview(self):
         if not self.camera or not self.camera_initialized:
@@ -3842,6 +5314,15 @@ class ZWOCameraGUI:
 
                     if self.is_recording and self.video_writer:
                         self.video_writer.write(img)
+
+                    # Cache the latest full-resolution RGB frame for the Focus
+                    # assistant. Copy() so subsequent buffer reuse by the SDK
+                    # doesn't mutate what we hand to the focus scorer.
+                    try:
+                        self._latest_preview_full_rgb = img.copy()
+                        self._latest_preview_full_ts = time.time()
+                    except Exception:
+                        pass
 
                     height, width = img.shape[:2]
                     scale = min(640 / width, 480 / height)
@@ -4296,8 +5777,38 @@ class ZWOCameraGUI:
 def main():
     root = tk.Tk()
     app = ZWOCameraGUI(root)
-    root.protocol("WM_DELETE_WINDOW", lambda: [app.cleanup(), root.destroy()])
-    root.mainloop()
+    closing = {"done": False}
+
+    def _close_app():
+        if closing["done"]:
+            return
+        closing["done"] = True
+        try:
+            app.cleanup()
+        except Exception:
+            pass
+        # Let pending Tk/CTk callbacks unwind before destruction.
+        try:
+            root.withdraw()
+        except Exception:
+            pass
+        try:
+            root.quit()
+        except Exception:
+            pass
+        try:
+            root.after(80, root.destroy)
+        except Exception:
+            try:
+                root.destroy()
+            except Exception:
+                pass
+
+    root.protocol("WM_DELETE_WINDOW", _close_app)
+    try:
+        root.mainloop()
+    except KeyboardInterrupt:
+        _close_app()
 
 
 if __name__ == "__main__":
