@@ -34,6 +34,8 @@ from pathlib import Path
 import time
 import traceback
 
+from ui_display_profile import ui_compact
+
 from astropy.io import fits
 from astropy.wcs import WCS
 from astropy.coordinates import SkyCoord
@@ -581,8 +583,13 @@ class StarFinderGUI:
         if self.session_dir:
             title += f" — {self.session_dir.name}"
         self.root.title(title)
-        self.root.geometry("1200x800")
-        
+        self._ui_compact = ui_compact(root)
+        if self._ui_compact:
+            self.root.geometry("1008x600")
+            self.root.minsize(720, 480)
+        else:
+            self.root.geometry("1200x800")
+
         self.star_detector = StarDetector()
         self.current_image_path = None
         self.current_image = None
@@ -600,7 +607,8 @@ class StarFinderGUI:
     def setup_ui(self):
         # Top control bar
         control_bar = tk.Frame(self.root)
-        control_bar.pack(side=tk.TOP, fill=tk.X, padx=12, pady=8)
+        _pad = (6, 4) if self._ui_compact else (12, 8)
+        control_bar.pack(side=tk.TOP, fill=tk.X, padx=_pad[0], pady=_pad[1])
         
         title_label = tk.Label(control_bar, text="SKY FINDER", font=("Segoe UI", 16, "bold"))
         title_label.pack(side=tk.LEFT, padx=6)
@@ -624,7 +632,7 @@ class StarFinderGUI:
 
         # Main container
         main_frame = tk.Frame(self.root)
-        main_frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=8)
+        main_frame.pack(fill=tk.BOTH, expand=True, padx=_pad[0], pady=_pad[1])
 
         # Left: image preview
         left_frame = tk.Frame(main_frame)
@@ -633,12 +641,13 @@ class StarFinderGUI:
         preview_label = tk.Label(left_frame, text="IMAGE PREVIEW", font=("Segoe UI", 11, "bold"))
         preview_label.pack(pady=(0, 8))
 
-        self.image_canvas = tk.Canvas(left_frame, width=550, height=550, highlightthickness=1)
+        _cv = 380 if self._ui_compact else 550
+        self.image_canvas = tk.Canvas(left_frame, width=_cv, height=_cv, highlightthickness=1)
         self.image_canvas.pack(padx=0, pady=0)
         
         self.image_label = tk.Label(self.image_canvas, text="No image loaded\nClick 'Load Image'",
                                     font=("Segoe UI", 11), justify=tk.CENTER)
-        self.image_canvas.create_window(275, 275, window=self.image_label)
+        self.image_canvas.create_window(_cv // 2, _cv // 2, window=self.image_label)
 
         btn_frame = tk.Frame(left_frame)
         btn_frame.pack(pady=10, fill=tk.X)

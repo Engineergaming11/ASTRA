@@ -5,6 +5,8 @@ Re-exports driver symbols from ioptron_mount for backward compatibility.
 
 import customtkinter as ctk
 
+from ui_display_profile import mount_standalone_geometry_minsize, ui_compact
+
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("dark-blue")
 
@@ -36,8 +38,9 @@ class MountControlApp(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title("iOptron HAE16C  ·  EQ Controller")
-        self.geometry("980x820")
-        self.minsize(860, 700)
+        _g, _mn = mount_standalone_geometry_minsize(compact=ui_compact(self))
+        self.geometry(_g)
+        self.minsize(_mn[0], _mn[1])
         self.configure(fg_color=STANDALONE_PAL["bg"])
         self._frame = MountControlsFrame(self, standalone=True)
         self._frame.pack(fill="both", expand=True)

@@ -17,6 +17,8 @@ Dependencies:
 
 import customtkinter as ctk
 import tkinter as tk
+
+from ui_display_profile import mount_standalone_geometry_minsize, ui_compact
 from tkinter import messagebox
 import threading
 import time
@@ -587,8 +589,9 @@ class MountControlApp(ctk.CTk):
 
     def _setup_window(self):
         self.title("iOptron HAE16C  ·  EQ Controller")
-        self.geometry("980x820")
-        self.minsize(860, 700)
+        _g, _mn = mount_standalone_geometry_minsize(compact=ui_compact(self))
+        self.geometry(_g)
+        self.minsize(_mn[0], _mn[1])
         self.configure(fg_color=PAL["bg"])
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 

@@ -17,6 +17,8 @@ import re
 import tkinter as tk
 from tkinter import ttk
 import customtkinter as ctk
+
+from ui_display_profile import ui_compact
 import matplotlib
 matplotlib.use("TkAgg")
 import matplotlib.patches as patches
@@ -194,7 +196,10 @@ class SkyChartApp(ctk.CTk):
         # ── window ──
         ctk.set_appearance_mode("dark")
         self.title("Polar Align — Sky Chart")
-        self.geometry("1100x750")
+        if ui_compact(self):
+            self.geometry("1008x580")
+        else:
+            self.geometry("1100x750")
         self.configure(fg_color=BG_PRIMARY)
         self.resizable(True, True)
         self.protocol('WM_DELETE_WINDOW', self._on_close)

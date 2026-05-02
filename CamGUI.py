@@ -65,6 +65,11 @@ from location_gps import try_read_lat_lon_nmea
 
 import deep_sky_stacker
 from xy_scroll_frame import attach_mousewheel_dispatch, create_xy_scroll_area, theme_xy_area
+from ui_display_profile import (
+    camgui_pane_minsizes,
+    main_window_geometry_minsize,
+    ui_compact,
+)
 
 
 def _default_capture_save_path() -> str:
@@ -367,8 +372,10 @@ class ZWOCameraGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("ASTRA")
-        self.root.geometry("1680x860")
-        self.root.minsize(1280, 700)
+        self._ui_compact = ui_compact(root)
+        _geom, _minwh = main_window_geometry_minsize(compact=self._ui_compact)
+        self.root.geometry(_geom)
+        self.root.minsize(_minwh[0], _minwh[1])
 
         # Raspberry Pi: start fullscreen (kiosk-style). Set ASTRA_FULLSCREEN=0 to disable.
         # Press Escape to leave fullscreen.
@@ -1040,11 +1047,13 @@ class ZWOCameraGUI:
         style.theme_use('clam')
 
         # TOP BAR
+        _tb_pad = (6, 4) if self._ui_compact else (12, 8)
         self.top_bar = tk.Frame(self.root)
-        self.top_bar.pack(fill=tk.X, padx=12, pady=8)
+        self.top_bar.pack(fill=tk.X, padx=_tb_pad[0], pady=_tb_pad[1])
 
+        _title_font = ("Segoe UI", 13, "bold") if self._ui_compact else ("Segoe UI", 16, "bold")
         self.title_label = tk.Label(
-            self.top_bar, text="CAMERA CONTROL", font=("Segoe UI", 16, "bold")
+            self.top_bar, text="CAMERA CONTROL", font=_title_font
         )
         self.title_label.pack(side=tk.LEFT)
 
@@ -1055,18 +1064,18 @@ class ZWOCameraGUI:
         # a long-running click handler is in flight, so the user always has
         # immediate feedback that the GUI accepted their click.
         self.busy_frame = tk.Frame(self.top_bar)
-        self.busy_frame.pack(side=tk.RIGHT, padx=(0, 16))
+        self.busy_frame.pack(side=tk.RIGHT, padx=(0, 8 if self._ui_compact else 16))
         self.busy_spinner_label = tk.Label(
             self.busy_frame,
             text="",
-            font=("Segoe UI", 14, "bold"),
+            font=("Segoe UI", 12, "bold") if self._ui_compact else ("Segoe UI", 14, "bold"),
             width=2,
         )
         self.busy_spinner_label.pack(side=tk.LEFT)
         self.busy_text_label = tk.Label(
             self.busy_frame,
             text="",
-            font=("Segoe UI", 10),
+            font=("Segoe UI", 9) if self._ui_compact else ("Segoe UI", 10),
             padx=4,
         )
         self.busy_text_label.pack(side=tk.LEFT)
@@ -1085,8 +1094,8 @@ class ZWOCameraGUI:
             text="☀ Day Mode",
             command=self.toggle_theme,
             font=("Segoe UI", 9),
-            width=120,
-            height=32,
+            width=92 if self._ui_compact else 120,
+            height=28 if self._ui_compact else 32,
             fg_color="#e0e0e0",
             text_color="#1a1a1a",
             hover_color="#0b5c8f",
@@ -1098,8 +1107,8 @@ class ZWOCameraGUI:
             text="Polar Align Mode",
             command=self._toggle_polar_align_mode,
             font=("Segoe UI", 9, "bold"),
-            width=150,
-            height=32,
+            width=112 if self._ui_compact else 150,
+            height=28 if self._ui_compact else 32,
             fg_color="#7a0c0c",
             text_color="#ffe6e6",
             hover_color="#d11515",
@@ -1108,8 +1117,9 @@ class ZWOCameraGUI:
         self.polar_align_mode_btn.pack(side=tk.RIGHT, padx=(0, 8))
 
         # MAIN CONTAINER — horizontal splitters so camera / center / mount can be resized (~1/3–2/3)
+        _main_pad = (4, 4) if self._ui_compact else (12, 8)
         self.main = tk.Frame(self.root)
-        self.main.pack(fill=tk.BOTH, expand=True, padx=12, pady=8)
+        self.main.pack(fill=tk.BOTH, expand=True, padx=_main_pad[0], pady=_main_pad[1])
         t0 = self.theme
         self._pan_outer = tk.PanedWindow(
             self.main,
@@ -1494,7 +1504,7 @@ class ZWOCameraGUI:
             self.left,
             text="Ready - No camera connected",
             font=("Segoe UI", 9, "italic"),
-            wraplength=240,
+            wraplength=176 if self._ui_compact else 240,
             justify=tk.LEFT,
             anchor=tk.W
         )
@@ -1513,10 +1523,11 @@ class ZWOCameraGUI:
         self.side_tools = tk.Frame(self._pan_inner, bg=t0["bg_primary"])
 
         # Inner needs room for center + mount mins; outer mins must fit (camera + inner ≥ window min).
-        self._pan_outer.add(self._left_pane_wrap, minsize=260, stretch="never")
-        self._pan_outer.add(self._pan_inner, minsize=980)
-        self._pan_inner.add(self.right, minsize=380)
-        self._pan_inner.add(self.side_tools, minsize=520)
+        _pl, _pi, _pc, _pm = camgui_pane_minsizes(compact=self._ui_compact)
+        self._pan_outer.add(self._left_pane_wrap, minsize=_pl, stretch="never")
+        self._pan_outer.add(self._pan_inner, minsize=_pi)
+        self._pan_inner.add(self.right, minsize=_pc)
+        self._pan_inner.add(self.side_tools, minsize=_pm)
 
         self.root.after_idle(self._set_initial_pane_sashes)
 
@@ -3261,9 +3272,11 @@ class ZWOCameraGUI:
 
         try:
             self.root.update_idletasks()
-            ow = max(self._pan_outer.winfo_width(), 800)
+            _ow_min = 420 if getattr(self, "_ui_compact", False) else 800
+            _iw_min = 360 if getattr(self, "_ui_compact", False) else 600
+            ow = max(self._pan_outer.winfo_width(), _ow_min)
             _place(self._pan_outer, int(ow * 0.26))
-            iw = max(self._pan_inner.winfo_width(), 600)
+            iw = max(self._pan_inner.winfo_width(), _iw_min)
             _place(self._pan_inner, int(iw * 0.58))
         except tk.TclError:
             pass
