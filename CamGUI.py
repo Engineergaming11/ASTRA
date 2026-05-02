@@ -1203,7 +1203,14 @@ class ZWOCameraGUI:
         )
         self._camera_tabs.pack(fill=tk.BOTH, expand=True, pady=(4, 0))
         self._camera_tabs.add("Camera")
-        _cam_xy = self._mk_xy(self._camera_tabs.tab("Camera"), t0["bg_primary"])
+        cam_tab = self._camera_tabs.tab("Camera")
+        # Pin capture actions below the scroll area so they stay visible (not only at the
+        # bottom of a tall scroll region inside the fixed-height Camera tab).
+        self._camera_capture_bar = tk.Frame(cam_tab, bg=t0["bg_primary"])
+        self._camera_capture_bar.pack(side=tk.BOTTOM, fill=tk.X, pady=(8, 4))
+        scroll_host = tk.Frame(cam_tab, bg=t0["bg_primary"])
+        scroll_host.pack(fill=tk.BOTH, expand=True)
+        _cam_xy = self._mk_xy(scroll_host, t0["bg_primary"])
         _cam_xy.outer.pack(fill=tk.BOTH, expand=True)
         camera_parent = _cam_xy.inner
         self._camera_tab_inner = camera_parent
@@ -1390,17 +1397,17 @@ class ZWOCameraGUI:
         )
         self.frame_type_dropdown.pack(fill=tk.X, pady=4)
 
-        # CAPTURE BUTTONS
-        ttk.Separator(camera_parent).pack(fill=tk.X, pady=10)
+        # CAPTURE BUTTONS (pinned in _camera_capture_bar — see above)
+        cap = self._camera_capture_bar
+        ttk.Separator(cap).pack(fill=tk.X, pady=(0, 10))
 
         tk.Label(
-            camera_parent, text="CAPTURE", font=("Segoe UI", 11, "bold")
+            cap, text="CAPTURE", font=("Segoe UI", 11, "bold")
         ).pack(anchor="w", pady=(0, 8))
 
-        # Helper function to create action buttons
         def create_action_button(text, command):
             return ctk.CTkButton(
-                camera_parent,
+                cap,
                 text=text,
                 command=command,
                 font=("Segoe UI", 9, "bold"),
@@ -4522,6 +4529,8 @@ class ZWOCameraGUI:
             _cfg = t["fg_primary"] if self.night_mode else _rp["fg"]
             if getattr(self, "_camera_tab_inner", None):
                 _theme_native_tk_under_camera_column(self._camera_tab_inner, _cbg, _cfg)
+            if getattr(self, "_camera_capture_bar", None):
+                _theme_native_tk_under_camera_column(self._camera_capture_bar, _cbg, _cfg)
             if getattr(self, "_focus_tab_inner", None):
                 _theme_native_tk_under_camera_column(self._focus_tab_inner, _cbg, _cfg)
         except Exception:
