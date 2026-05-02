@@ -50,7 +50,15 @@ def _preferred_astrometry_data_dir() -> Path:
 
 
 def _candidate_astrometry_cfg_paths() -> list[Path]:
-    paths = [Path("/opt/homebrew/etc/astrometry.cfg")]
+    paths: list[Path] = []
+    # Linux / Raspberry Pi OS (apt install astrometry.net)
+    for p in (Path("/etc/astrometry.cfg"), Path("/usr/local/etc/astrometry.cfg")):
+        if p.exists():
+            paths.append(p)
+    # macOS Homebrew
+    hb = Path("/opt/homebrew/etc/astrometry.cfg")
+    if hb.exists():
+        paths.append(hb)
     cellar = Path("/opt/homebrew/Cellar/astrometry-net")
     if cellar.exists():
         for ver in sorted(cellar.iterdir(), reverse=True):
@@ -264,7 +272,11 @@ def run_solve_field_local(image_path, ra, dec, fov_deg, out_basename, solve_fiel
     ]
 
     def _solve_with_args(img: Path, extra_args: list[str], pass_name: str, base: str):
-        cmd = [solve_field_cmd, str(img), "--overwrite"] + out_args_for(base) + extra_args
+        # Always include ~/astrometry/data so indexes from "Download indexes for FOV"
+        # are visible on Linux/Pi even when /etc/astrometry.cfg only lists /usr/share/...
+        # (astrometry-engine treats --index-dir as additional to the config file).
+        data_dir = Path(setup_info.get("data_dir") or _preferred_astrometry_data_dir())
+        cmd = [solve_field_cmd, "--index-dir", str(data_dir), str(img), "--overwrite"] + out_args_for(base) + extra_args
         try:
             proc = subprocess.run(
                 cmd,
