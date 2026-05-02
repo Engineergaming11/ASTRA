@@ -71,6 +71,19 @@ def _default_capture_save_path() -> str:
     return str(Path.home() / "ASICAP" / "CapGUI")
 
 
+def _is_raspberry_pi() -> bool:
+    """True when running on Raspberry Pi hardware (Linux device tree)."""
+    try:
+        model_path = Path("/proc/device-tree/model")
+        if not model_path.is_file():
+            return False
+        return "raspberry pi" in model_path.read_text(
+            encoding="utf-8", errors="ignore"
+        ).lower()
+    except OSError:
+        return False
+
+
 def _resolved_asi_library_path(app_dir: Path) -> str:
     """Prefer an ASI SDK binary next to this script; extension depends on OS."""
     if sys.platform == "darwin":
@@ -309,6 +322,25 @@ class ZWOCameraGUI:
         self.root.geometry("1680x860")
         self.root.minsize(1280, 700)
 
+        # Raspberry Pi: start fullscreen (kiosk-style). Set ASTRA_FULLSCREEN=0 to disable.
+        # Press Escape to leave fullscreen.
+        if _is_raspberry_pi():
+            _fs_env = os.environ.get("ASTRA_FULLSCREEN", "1").strip().lower()
+            if _fs_env not in ("0", "false", "no", "off"):
+                try:
+                    self.root.update_idletasks()
+                    self.root.attributes("-fullscreen", True)
+                except tk.TclError:
+                    pass
+
+                def _exit_fullscreen(_ev=None):
+                    try:
+                        self.root.attributes("-fullscreen", False)
+                    except tk.TclError:
+                        pass
+
+                self.root.bind("<Escape>", _exit_fullscreen)
+
         # Theme settings
         self.night_mode = False
         self.theme = THEMES["day"]
@@ -384,7 +416,14 @@ class ZWOCameraGUI:
             os.makedirs(self.save_path, exist_ok=True)
         except Exception as e:
             print(f"Warning: Could not create save directory {self.save_path}: {e}")
-            self.save_path = str(Path.home())
+            # Persist a Linux/macOS/Windows-safe fallback when a stale path from
+            # another machine (for example /Users/... on Raspberry Pi) is loaded.
+            self.save_path = _default_capture_save_path()
+            try:
+                os.makedirs(self.save_path, exist_ok=True)
+            except Exception:
+                self.save_path = str(Path.home())
+            self._save_site_settings()
 
         self._livewcs_last_mtime = None
         self._livewcs_poll_running = False
