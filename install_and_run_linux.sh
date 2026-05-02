@@ -230,13 +230,18 @@ fi
 if command -v solve-field >/dev/null 2>&1; then
   ASTRO_DATA_DIR="${HOME}/astrometry/data"
   mkdir -p "${ASTRO_DATA_DIR}" || warn "Could not create ${ASTRO_DATA_DIR}"
-  # Debian/Pi OS install of astrometry.net puts its config here:
+  # Prefer explicit path on Pi (e.g. user copy): export ASTRA_ASTROMETRY_CFG=/path/to/astrometry.cfg
   ASTRO_CFG_CANDIDATES=(
+    "${ASTRA_ASTROMETRY_CFG:-}"
+    "${ASTROMETRY_CFG:-}"
     "/etc/astrometry.cfg"
     "/usr/local/etc/astrometry.cfg"
+    "${HOME}/astrometry/astrometry.cfg"
+    "${HOME}/.config/astrometry/astrometry.cfg"
   )
   ASTRO_CFG=""
   for c in "${ASTRO_CFG_CANDIDATES[@]}"; do
+    [[ -z "${c}" ]] && continue
     if [[ -f "${c}" ]]; then
       ASTRO_CFG="${c}"
       break
@@ -261,7 +266,7 @@ if command -v solve-field >/dev/null 2>&1; then
       rm -f "${TMP_CFG}"
     fi
   else
-    warn "No astrometry.cfg found in /etc or /usr/local/etc; index path not auto-updated."
+    warn "No astrometry.cfg found (checked ASTRA_ASTROMETRY_CFG, /etc, /usr/local/etc, ~/astrometry, ~/.config/astrometry); index path not auto-updated."
   fi
   INDEX_COUNT="$(ls "${ASTRO_DATA_DIR}"/index-*.fits 2>/dev/null | wc -l | tr -d ' ')"
   if [[ "${INDEX_COUNT}" == "0" ]]; then

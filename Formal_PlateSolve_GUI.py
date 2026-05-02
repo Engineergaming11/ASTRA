@@ -50,23 +50,47 @@ def _preferred_astrometry_data_dir() -> Path:
 
 
 def _candidate_astrometry_cfg_paths() -> list[Path]:
+    """Ordered search for astrometry-engine config. Override with ASTRA_ASTROMETRY_CFG or ASTROMETRY_CFG."""
     paths: list[Path] = []
+    seen: set[str] = set()
+
+    def add(p: Path) -> None:
+        try:
+            cand = p.expanduser()
+            if not cand.is_file():
+                return
+            key = str(cand.resolve())
+        except OSError:
+            return
+        if key not in seen:
+            seen.add(key)
+            paths.append(cand)
+
+    for env_key in ("ASTRA_ASTROMETRY_CFG", "ASTROMETRY_CFG"):
+        raw = (os.environ.get(env_key) or "").strip()
+        if raw:
+            add(Path(raw))
     # Linux / Raspberry Pi OS (apt install astrometry.net)
     for p in (Path("/etc/astrometry.cfg"), Path("/usr/local/etc/astrometry.cfg")):
-        if p.exists():
-            paths.append(p)
+        add(p)
+    # User-writable copies when /etc is missing or not preferred (common on embedded setups)
+    home = Path.home()
+    for p in (home / "astrometry" / "astrometry.cfg", home / ".config" / "astrometry" / "astrometry.cfg"):
+        add(p)
     # macOS Homebrew
     hb = Path("/opt/homebrew/etc/astrometry.cfg")
-    if hb.exists():
-        paths.append(hb)
+    add(hb)
     cellar = Path("/opt/homebrew/Cellar/astrometry-net")
     if cellar.exists():
         for ver in sorted(cellar.iterdir(), reverse=True):
-            cfg = ver / "etc" / "astrometry.cfg"
-            if cfg.exists():
-                paths.append(cfg)
-                break
+            add(ver / "etc" / "astrometry.cfg")
+            break
     return paths
+
+
+def _primary_astrometry_cfg_path() -> Path | None:
+    cands = _candidate_astrometry_cfg_paths()
+    return cands[0] if cands else None
 
 
 def _normalize_astrometry_cfg_path_line(cfg_path: Path, preferred_data_dir: Path) -> tuple[bool, str]:
@@ -293,7 +317,15 @@ def run_solve_field_local(
         # are visible on Linux/Pi even when /etc/astrometry.cfg only lists /usr/share/...
         # (astrometry-engine treats --index-dir as additional to the config file).
         data_dir = Path(setup_info.get("data_dir") or _preferred_astrometry_data_dir())
-        cmd = [solve_field_cmd, "--index-dir", str(data_dir), str(img), "--overwrite"] + out_args_for(base) + extra_args
+        cfg_path = _primary_astrometry_cfg_path()
+        cfg_args = ["--config", str(cfg_path)] if cfg_path else []
+        cmd = (
+            [solve_field_cmd]
+            + cfg_args
+            + ["--index-dir", str(data_dir), str(img), "--overwrite"]
+            + out_args_for(base)
+            + extra_args
+        )
         try:
             proc = subprocess.run(
                 cmd,
