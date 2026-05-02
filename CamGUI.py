@@ -64,6 +64,7 @@ from ioptron_mount import (
 from location_gps import try_read_lat_lon_nmea
 
 import deep_sky_stacker
+from xy_scroll_frame import attach_mousewheel_dispatch, create_xy_scroll_area, theme_xy_area
 
 
 def _default_capture_save_path() -> str:
@@ -158,6 +159,53 @@ PLATE_RED_PAL = {
     "border":       "#4d2020",
     "btn_text":     "#ffe6e6",
 }
+
+# Slider track + thumb: use red palette everywhere so CTkSlider never falls back to a light/white track.
+_RED_SLIDER = {
+    "button_color": PLATE_RED_PAL["accent"],
+    "button_hover_color": PLATE_RED_PAL["accent_hover"],
+    "progress_color": PLATE_RED_PAL["accent"],
+    "fg_color": PLATE_RED_PAL["bg_alt"],
+}
+
+
+def _theme_native_tk_under_camera_column(parent: tk.Misc, bg: str, fg: str) -> None:
+    """Recursively set native ``tk.Frame`` / ``tk.Label`` colours under a subtree.
+
+    Pierces CTk containers (e.g. tab views) but skips leaf CustomTkinter controls so
+    slider rows and path frames pick up the dark/red panel instead of default grey.
+    """
+    _leaf_ctk = (
+        ctk.CTkComboBox,
+        ctk.CTkButton,
+        ctk.CTkSlider,
+        ctk.CTkEntry,
+        ctk.CTkOptionMenu,
+        ctk.CTkSwitch,
+        ctk.CTkCheckBox,
+    )
+    try:
+        children = parent.winfo_children()
+    except tk.TclError:
+        return
+    for child in children:
+        if isinstance(child, tk.Label):
+            try:
+                child.configure(bg=bg, fg=fg)
+            except tk.TclError:
+                pass
+            continue
+        if isinstance(child, tk.Frame):
+            if type(child) is tk.Frame:
+                try:
+                    child.configure(bg=bg)
+                except tk.TclError:
+                    pass
+            _theme_native_tk_under_camera_column(child, bg, fg)
+            continue
+        if isinstance(child, _leaf_ctk):
+            continue
+        _theme_native_tk_under_camera_column(child, bg, fg)
 
 
 # Default equipment preset. The user always images from Tucson, AZ with a
@@ -378,9 +426,6 @@ class ZWOCameraGUI:
         self._last_solve_ra_deg = None
         self._last_solve_dec_deg = None
         self._last_plate_solve_input_path = None
-        self._sun_crosshair_enabled = True
-        self._sun_crosshair_size_px = 18
-        self._sun_crosshair_thickness = 2
         # In-app session captures for Session photos tab (fits_path, captured_at iso, ra/dec if solved)
         self._session_photos = []
         # Focus assistant state (camera-side Focus tab). Samples are dicts with
@@ -402,6 +447,11 @@ class ZWOCameraGUI:
         self._dsk_thread: threading.Thread | None = None
         self._dsk_last_result = None
         self._dsk_preview_imgtk: ImageTk.PhotoImage | None = None
+        # Bidirectional scroll regions (see ``xy_scroll_frame``); mouse wheel dispatch uses this list.
+        self._xy_scroll_areas: list = []
+        self._xy_plate = None
+        self._xy_polar = None
+        self._polar_align_shell = None
         self._dsk_count_lights_var = None
         self._dsk_count_darks_var = None
         self._dsk_count_flats_var = None
@@ -979,6 +1029,12 @@ class ZWOCameraGUI:
             raise RuntimeError("Camera capture returned no frame")
         return frame
 
+    def _mk_xy(self, parent, bg: str):
+        """Create a horizontal+vertical scroll area and register it for theme + mouse wheel."""
+        a = create_xy_scroll_area(parent, bg=bg)
+        self._xy_scroll_areas.append(a)
+        return a
+
     def setup_ui(self):
         style = ttk.Style()
         style.theme_use('clam')
@@ -1065,17 +1121,11 @@ class ZWOCameraGUI:
         )
         self._pan_outer.pack(fill=tk.BOTH, expand=True)
 
-        # Tk PanedWindow only accepts native Tk widgets; wrap CTkScrollableFrame in tk.Frame.
+        # Tk PanedWindow only accepts native Tk widgets; bidirectional scroll inside tk.Frame.
         self._left_pane_wrap = tk.Frame(self._pan_outer, bg=t0["bg_primary"])
-        self.left_scroll = ctk.CTkScrollableFrame(
-            self._left_pane_wrap,
-            width=300,
-            fg_color="transparent",
-            scrollbar_button_color="#999999",
-            scrollbar_button_hover_color="#777777",
-        )
-        self.left_scroll.pack(fill=tk.BOTH, expand=True)
-        self.left = self.left_scroll  # alias so all existing widget code works unchanged
+        _left_xy = self._mk_xy(self._left_pane_wrap, t0["bg_primary"])
+        _left_xy.outer.pack(fill=tk.BOTH, expand=True)
+        self.left = _left_xy.inner
 
         tk.Label(
             self.left, text="CAMERA CONTROLS", font=("Segoe UI", 11, "bold")
@@ -1153,7 +1203,10 @@ class ZWOCameraGUI:
         )
         self._camera_tabs.pack(fill=tk.BOTH, expand=True, pady=(4, 0))
         self._camera_tabs.add("Camera")
-        camera_parent = self._camera_tabs.tab("Camera")
+        _cam_xy = self._mk_xy(self._camera_tabs.tab("Camera"), t0["bg_primary"])
+        _cam_xy.outer.pack(fill=tk.BOTH, expand=True)
+        camera_parent = _cam_xy.inner
+        self._camera_tab_inner = camera_parent
 
         # Helper function to create dropdown controls
         def create_dropdown_control(label_text, var, options, command=None):
@@ -1223,12 +1276,9 @@ class ZWOCameraGUI:
                 to=to,
                 variable=var,
                 command=command,
-                button_color="#0b5c8f",
-                button_hover_color="#1a7ab5",
-                progress_color="#0b5c8f",
-                fg_color="#e0e0e0",
                 width=160,
-                height=16
+                height=16,
+                **_RED_SLIDER,
             )
             slider.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
 
@@ -1369,7 +1419,12 @@ class ZWOCameraGUI:
 
         # FOCUS ASSISTANT TAB — sibling of "Camera"
         self._camera_tabs.add("Focus")
-        self._build_focus_tab(self._camera_tabs.tab("Focus"))
+        _focus_xy = self._mk_xy(self._camera_tabs.tab("Focus"), t0["bg_primary"])
+        _focus_xy.outer.pack(fill=tk.BOTH, expand=True)
+        self._focus_tab_inner = _focus_xy.inner
+        self._xy_camera_tab_scroll = _cam_xy
+        self._xy_focus_tab_scroll = _focus_xy
+        self._build_focus_tab(_focus_xy.inner)
 
         # SKY TRACKER SECTION
         ttk.Separator(self.left).pack(fill=tk.X, pady=10)
@@ -1460,6 +1515,13 @@ class ZWOCameraGUI:
 
         self._build_center_tabs()
         self._build_mount_column()
+        attach_mousewheel_dispatch(
+            self.root,
+            self._xy_scroll_areas,
+            extra_area_lists=[
+                getattr(self.mount_panel, "_mount_xy_areas", []),
+            ],
+        )
 
     def _build_center_tabs(self):
         t = self.theme
@@ -1476,9 +1538,11 @@ class ZWOCameraGUI:
         self._center_tabs.pack(fill=tk.BOTH, expand=True)
 
         self._center_tabs.add("Live preview")
-        live = self._center_tabs.tab("Live preview")
+        live_tab = self._center_tabs.tab("Live preview")
+        _live_xy = self._mk_xy(live_tab, t["bg_primary"])
+        _live_xy.outer.pack(fill=tk.BOTH, expand=True)
         self.preview_label = tk.Label(
-            live,
+            _live_xy.inner,
             text="No preview available\nConnect a camera for live preview",
             font=("Segoe UI", 12),
             justify=tk.CENTER,
@@ -1487,7 +1551,10 @@ class ZWOCameraGUI:
 
         self._center_tabs.add("Session photos")
         session_tab = self._center_tabs.tab("Session photos")
-        sbtn = ctk.CTkFrame(session_tab, fg_color="transparent")
+        _sess_xy = self._mk_xy(session_tab, t["bg_primary"])
+        _sess_xy.outer.pack(fill=tk.BOTH, expand=True)
+        session_inner = _sess_xy.inner
+        sbtn = ctk.CTkFrame(session_inner, fg_color="transparent")
         sbtn.pack(fill=tk.X, padx=8, pady=6)
         ctk.CTkButton(
             sbtn,
@@ -1510,7 +1577,7 @@ class ZWOCameraGUI:
             width=170,
             font=("Segoe UI", 9, "bold"),
         ).pack(side=tk.LEFT, padx=(8, 0))
-        list_wrap = tk.Frame(session_tab)
+        list_wrap = tk.Frame(session_inner)
         list_wrap.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
         self._session_listbox = tk.Listbox(
             list_wrap,
@@ -1525,7 +1592,10 @@ class ZWOCameraGUI:
         sb.pack(side=tk.RIGHT, fill=tk.Y)
 
         self._center_tabs.add("Site / Sky")
-        site = self._center_tabs.tab("Site / Sky")
+        site_tab = self._center_tabs.tab("Site / Sky")
+        _site_xy = self._mk_xy(site_tab, t["bg_primary"])
+        _site_xy.outer.pack(fill=tk.BOTH, expand=True)
+        site = _site_xy.inner
         ctk.CTkLabel(site, text="Observer site (degrees, WGS84)", font=("Segoe UI", 11, "bold")).pack(
             anchor="w", padx=8, pady=(6, 4)
         )
@@ -1587,8 +1657,9 @@ class ZWOCameraGUI:
         except Exception:
             pass
 
-        scroll = ctk.CTkScrollableFrame(parent, fg_color=t["bg_primary"])
-        scroll.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+        _dsk_xy = self._mk_xy(parent, t["bg_primary"])
+        _dsk_xy.outer.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+        scroll = _dsk_xy.inner
 
         ctk.CTkLabel(
             scroll,
@@ -2097,8 +2168,10 @@ class ZWOCameraGUI:
         except Exception:
             pass
 
-        outer = ctk.CTkFrame(plate, fg_color=pal["bg"], border_color=pal["border"], border_width=0)
-        outer.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+        self._xy_plate = self._mk_xy(plate, pal["bg"])
+        self._xy_plate.outer.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+        outer = ctk.CTkFrame(self._xy_plate.inner, fg_color=pal["bg"], border_color=pal["border"], border_width=0)
+        outer.pack(fill=tk.BOTH, expand=True)
         # Track all plate-tab widgets so apply_theme can reapply red colours.
         self._plate_widgets: list = [plate, outer]
 
@@ -2750,8 +2823,10 @@ class ZWOCameraGUI:
     def _build_polar_align_panel(self):
         """Red-mode right panel: displays plate-solve based polar alignment guidance."""
         pal = PLATE_RED_PAL
+        self._xy_polar = self._mk_xy(self.side_tools, pal["bg"])
+        self._polar_align_shell = self._xy_polar.outer
         panel = ctk.CTkFrame(
-            self.side_tools,
+            self._xy_polar.inner,
             fg_color=pal["bg"],
             border_color=pal["border"],
             border_width=1,
@@ -2844,13 +2919,13 @@ class ZWOCameraGUI:
         if enabled:
             if self.mount_panel is not None:
                 self.mount_panel.pack_forget()
-            if self._polar_align_panel is not None:
-                self._polar_align_panel.pack(fill=tk.BOTH, expand=True, padx=2, pady=4)
+            if self._polar_align_shell is not None:
+                self._polar_align_shell.pack(fill=tk.BOTH, expand=True, padx=2, pady=4)
             self._refresh_polar_align_panel()
             self.update_status("Polar Align Mode enabled.")
         else:
-            if self._polar_align_panel is not None:
-                self._polar_align_panel.pack_forget()
+            if self._polar_align_shell is not None:
+                self._polar_align_shell.pack_forget()
             if self.mount_panel is not None:
                 self.mount_panel.pack(fill=tk.BOTH, expand=True, padx=2, pady=4)
             self.update_status("Mount controls restored.")
@@ -4110,6 +4185,14 @@ class ZWOCameraGUI:
     def apply_theme(self):
         """Apply the current theme to all UI elements"""
         t = self.theme
+        _rp = PLATE_RED_PAL
+        try:
+            st = ttk.Style()
+            st.theme_use("clam")
+            st.configure("TSeparator", background=t["border"])
+            st.configure("Horizontal.TSeparator", background=t["border"])
+        except Exception:
+            pass
 
         def _descendant_ctk_buttons(root_widget):
             found = []
@@ -4145,15 +4228,19 @@ class ZWOCameraGUI:
             except Exception:
                 pass
 
-        # Style the scrollable panel
-        try:
-            self.left_scroll.configure(
-                fg_color=t["bg_primary"],
-                scrollbar_button_color=t["bg_tertiary"],
-                scrollbar_button_hover_color=t["bg_secondary"],
-            )
-        except:
-            pass
+        # Bidirectional scroll regions (tk Canvas + scrollbars)
+        _cam_scr = getattr(self, "_xy_camera_tab_scroll", None)
+        _foc_scr = getattr(self, "_xy_focus_tab_scroll", None)
+        _trough_main = t["bg_tertiary"]
+        for a in getattr(self, "_xy_scroll_areas", []):
+            if a is getattr(self, "_xy_plate", None) or a is getattr(self, "_xy_polar", None):
+                continue
+            if a is _cam_scr or a is _foc_scr:
+                _sbg = t["bg_primary"] if self.night_mode else _rp["bg"]
+                _str = t["bg_tertiary"] if self.night_mode else _rp["bg_alt"]
+                theme_xy_area(a, _sbg, trough=_str)
+            else:
+                theme_xy_area(a, t["bg_primary"], trough=_trough_main)
 
         # Labels
         label_configs = [
@@ -4253,27 +4340,28 @@ class ZWOCameraGUI:
         except Exception:
             pass
 
-        # Path entry
+        # Path / project entries — match red/dark camera controls (no white fields in day mode).
         self.path_entry.configure(
-            fg_color=t["bg_secondary"] if self.night_mode else "white",
-            text_color=t["fg_primary"],
-            border_color=t["border"]
+            fg_color=t["bg_secondary"] if self.night_mode else _rp["bg"],
+            text_color=t["fg_primary"] if self.night_mode else _rp["fg"],
+            border_color=t["border"] if self.night_mode else _rp["border"],
         )
 
-        # Project name entry
         self.project_name_entry.configure(
-            fg_color=t["bg_secondary"] if self.night_mode else "white",
-            text_color=t["fg_primary"],
-            placeholder_text_color=t["fg_primary"],
-            border_color=t["border"]
+            fg_color=t["bg_secondary"] if self.night_mode else _rp["bg"],
+            text_color=t["fg_primary"] if self.night_mode else _rp["fg"],
+            placeholder_text_color=t["fg_tertiary"] if self.night_mode else _rp["fg_muted"],
+            border_color=t["border"] if self.night_mode else _rp["border"],
         )
 
+        _tab_sel = t["accent"] if self.night_mode else _rp["accent"]
+        _tab_sel_h = t["accent_light"] if self.night_mode else _rp["accent_hover"]
         try:
             self._center_tabs.configure(
                 fg_color=t["bg_primary"],
                 segmented_button_fg_color=t["bg_tertiary"],
-                segmented_button_selected_color=t["accent"],
-                segmented_button_selected_hover_color=t["accent_light"],
+                segmented_button_selected_color=_tab_sel,
+                segmented_button_selected_hover_color=_tab_sel_h,
                 segmented_button_unselected_color=t["bg_secondary"],
                 segmented_button_unselected_hover_color=t["bg_tertiary"],
                 text_color=t["fg_primary"],
@@ -4282,15 +4370,26 @@ class ZWOCameraGUI:
             pass
 
         try:
-            self._camera_tabs.configure(
-                fg_color=t["bg_primary"],
-                segmented_button_fg_color=t["bg_tertiary"],
-                segmented_button_selected_color=t["accent"],
-                segmented_button_selected_hover_color=t["accent_light"],
-                segmented_button_unselected_color=t["bg_secondary"],
-                segmented_button_unselected_hover_color=t["bg_tertiary"],
-                text_color=t["fg_primary"],
-            )
+            if self.night_mode:
+                self._camera_tabs.configure(
+                    fg_color=t["bg_primary"],
+                    segmented_button_fg_color=t["bg_tertiary"],
+                    segmented_button_selected_color=_tab_sel,
+                    segmented_button_selected_hover_color=_tab_sel_h,
+                    segmented_button_unselected_color=t["bg_secondary"],
+                    segmented_button_unselected_hover_color=t["bg_tertiary"],
+                    text_color=t["fg_primary"],
+                )
+            else:
+                self._camera_tabs.configure(
+                    fg_color=_rp["bg"],
+                    segmented_button_fg_color=_rp["bg_panel"],
+                    segmented_button_selected_color=_rp["accent"],
+                    segmented_button_selected_hover_color=_rp["accent_hover"],
+                    segmented_button_unselected_color=_rp["bg_alt"],
+                    segmented_button_unselected_hover_color=_rp["bg_panel"],
+                    text_color=_rp["fg"],
+                )
         except Exception:
             pass
 
@@ -4323,18 +4422,15 @@ class ZWOCameraGUI:
                 )
             focus_lb = getattr(self, "focus_listbox", None)
             if focus_lb is not None:
-                lb_bg = t["canvas_bg"] if not self.night_mode else t["bg_tertiary"]
+                lb_bg = _rp["bg"] if not self.night_mode else t["bg_tertiary"]
+                lb_fg = _rp["fg"] if not self.night_mode else t["fg_primary"]
                 focus_lb.configure(
                     bg=lb_bg,
-                    fg=t["fg_primary"],
+                    fg=lb_fg,
                     selectbackground=t["accent"],
                     selectforeground=("white" if not self.night_mode else t["bg_primary"]),
-                    highlightbackground=t["border"],
+                    highlightbackground=t["border"] if self.night_mode else _rp["border"],
                 )
-            for lbl_attr in ("focus_status_label", "focus_best_label"):
-                lbl = getattr(self, lbl_attr, None)
-                if lbl is not None:
-                    lbl.configure(bg=t["bg_primary"], fg=t["fg_primary"])
             if getattr(self, "_focus_canvas", None) is not None:
                 self._focus_redraw_plot()
         except Exception:
@@ -4373,6 +4469,7 @@ class ZWOCameraGUI:
                     fg_color=pal["bg"],
                     border_color=pal["border"],
                 )
+            theme_xy_area(getattr(self, "_xy_polar", None), pal["bg"], trough=pal["bg_alt"])
             if self._polar_align_text is not None:
                 self._polar_align_text.configure(
                     bg=pal["bg_alt"],
@@ -4381,17 +4478,19 @@ class ZWOCameraGUI:
                     highlightbackground=pal["border"],
                     highlightcolor=pal["accent"],
                 )
+            if getattr(self, "_polar_align_fov_slider", None) is not None:
+                self._polar_align_fov_slider.configure(**_RED_SLIDER)
         except Exception:
             pass
 
         combo_settings = {
-            "fg_color": t["bg_secondary"] if self.night_mode else "white",
-            "text_color": t["fg_primary"] if self.night_mode else "#1a1a1a",
-            "border_color": t["border"] if self.night_mode else "#cccccc",
-            "button_color": t["accent"],
-            "button_hover_color": t["accent_light"],
-            "dropdown_fg_color": t["bg_tertiary"] if self.night_mode else "white",
-            "dropdown_hover_color": t["bg_secondary"] if self.night_mode else "#f0f0f0"
+            "fg_color": t["bg_secondary"] if self.night_mode else PLATE_RED_PAL["bg_alt"],
+            "text_color": t["fg_primary"] if self.night_mode else PLATE_RED_PAL["fg"],
+            "border_color": t["border"] if self.night_mode else PLATE_RED_PAL["border"],
+            "button_color": PLATE_RED_PAL["accent"],
+            "button_hover_color": PLATE_RED_PAL["accent_hover"],
+            "dropdown_fg_color": t["bg_tertiary"] if self.night_mode else PLATE_RED_PAL["bg_panel"],
+            "dropdown_hover_color": t["bg_secondary"] if self.night_mode else PLATE_RED_PAL["bg_alt"],
         }
 
         combo_list = [
@@ -4405,27 +4504,28 @@ class ZWOCameraGUI:
         for combo in combo_list:
             combo.configure(**combo_settings)
 
-        slider_settings = {
-            "button_color": t["accent"],
-            "button_hover_color": t["accent_light"],
-            "progress_color": t["accent"],
-            "fg_color": t["bg_tertiary"]
-        }
+        self.exposure_slider.configure(**_RED_SLIDER)
+        self.gain_slider.configure(**_RED_SLIDER)
 
-        self.exposure_slider.configure(**slider_settings)
-        self.gain_slider.configure(**slider_settings)
-
-        entry_settings = {
-            "fg_color": t["bg_secondary"] if self.night_mode else "white",
-            "text_color": t["fg_primary"],
-            "border_color": t["border"],
-        }
         mp = getattr(self, "mount_panel", None)
         if mp is not None:
             try:
                 mp.apply_camgui_theme(t)
             except Exception:
                 pass
+
+        # Native tk frames/labels under the camera column (including Camera/Focus tab bodies):
+        # default Tk grey backgrounds do not follow CTk theme.
+        try:
+            _theme_native_tk_under_camera_column(self.left, t["bg_primary"], t["fg_primary"])
+            _cbg = t["bg_primary"] if self.night_mode else _rp["bg"]
+            _cfg = t["fg_primary"] if self.night_mode else _rp["fg"]
+            if getattr(self, "_camera_tab_inner", None):
+                _theme_native_tk_under_camera_column(self._camera_tab_inner, _cbg, _cfg)
+            if getattr(self, "_focus_tab_inner", None):
+                _theme_native_tk_under_camera_column(self._focus_tab_inner, _cbg, _cfg)
+        except Exception:
+            pass
 
         # Plate-solve tab uses a permanent red palette so the field-night view
         # stays dark-adapted regardless of day/night mode.
@@ -4434,6 +4534,7 @@ class ZWOCameraGUI:
     def _reapply_plate_red_palette(self):
         """Force the plate-solve tab back to its red palette after a theme change."""
         pal = PLATE_RED_PAL
+        theme_xy_area(getattr(self, "_xy_plate", None), pal["bg"], trough=pal["bg_alt"])
         widgets = getattr(self, "_plate_widgets", None)
         if not widgets:
             return
@@ -5323,21 +5424,6 @@ class ZWOCameraGUI:
             return
         try:
             img_pil = Image.fromarray(img_rgb)
-            if self._sun_crosshair_enabled:
-                w, h = img_pil.size
-                cx, cy = w // 2, h // 2
-                s = int(self._sun_crosshair_size_px)
-                t = int(self._sun_crosshair_thickness)
-                dr = ImageDraw.Draw(img_pil)
-                color = (255, 80, 80) if self.night_mode else (255, 0, 0)
-                dr.line((cx - s, cy, cx + s, cy), fill=color, width=t)
-                dr.line((cx, cy - s, cx, cy + s), fill=color, width=t)
-                dr.ellipse((cx - 2, cy - 2, cx + 2, cy + 2), fill=color, outline=color)
-                hint = "Center crosshair on Sun, then click 'Aligned \u2014 Sync & Track' in the mount panel"
-                text_y = max(8, cy - s - 24)
-                # Soft background stripe keeps text readable on bright solar frames.
-                dr.rectangle((6, text_y - 2, w - 6, text_y + 16), fill=(0, 0, 0))
-                dr.text((10, text_y), hint, fill=(255, 140, 140) if self.night_mode else (255, 230, 230))
             img_tk = ImageTk.PhotoImage(image=img_pil)
             self.preview_label.configure(image=img_tk, text="")
             self.preview_label.image = img_tk

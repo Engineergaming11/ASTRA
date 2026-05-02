@@ -25,6 +25,7 @@ from ioptron_mount import (
     _parse_ra_input,
 )
 from sky_ephemeris import radec_to_altaz_deg, sun_apparent_radec_deg
+from xy_scroll_frame import create_xy_scroll_area, theme_xy_area
 
 # Tucson fixed-site assumption for daytime sun tracking workflow.
 TUCSON_LAT = 32.2226
@@ -77,7 +78,8 @@ PAL = STANDALONE_PAL
 def _mount_palette_for_camgui_theme(t: Dict[str, str]) -> Dict[str, str]:
     """Semantic colours aligned with ``CamGUI.THEMES`` day/night tokens."""
     is_day = t.get("bg_primary") == "#f5f5f5"
-    entry_bg = "white" if is_day else t["bg_tertiary"]
+    # Match CamGUI red field palette in day mode (avoid bright white entry wells).
+    entry_bg = "#2d1410" if is_day else t["bg_tertiary"]
     return {
         "bg":              t["bg_primary"],
         "panel":           t["bg_secondary"],
@@ -139,6 +141,7 @@ class MountControlsFrame(ctk.CTkFrame):
         self._nudge_active: set = set()
         self._nudge_cmd_queue = queue.Queue()
         self._nudge_worker_thread: Optional[threading.Thread] = None
+        self._mount_xy_areas: list = []
 
         self._build_ui()
         self._refresh_ports()
@@ -172,7 +175,10 @@ class MountControlsFrame(ctk.CTkFrame):
         self._build_set_tab(self._tabs.tab("Setup"))
 
     def _build_manual_tab(self, parent):
-        content = ctk.CTkFrame(parent, fg_color="transparent")
+        area = create_xy_scroll_area(parent, bg=self._pal["bg"])
+        self._mount_xy_areas.append(area)
+        area.outer.pack(fill="both", expand=True)
+        content = ctk.CTkFrame(area.inner, fg_color="transparent")
         content.pack(fill="both", expand=True)
         content.columnconfigure(0, weight=1)
         content.columnconfigure(1, weight=1)
@@ -193,12 +199,16 @@ class MountControlsFrame(ctk.CTkFrame):
         self._build_log_panel(log_row)
 
     def _build_auto_tracking_tab(self, parent):
-        content = ctk.CTkFrame(parent, fg_color="transparent")
-        content.pack(fill="both", expand=True)
-        self._build_tracking_panel(content)
+        area = create_xy_scroll_area(parent, bg=self._pal["bg"])
+        self._mount_xy_areas.append(area)
+        area.outer.pack(fill="both", expand=True)
+        self._build_tracking_panel(area.inner)
 
     def _build_set_tab(self, parent):
-        content = ctk.CTkFrame(parent, fg_color="transparent")
+        area = create_xy_scroll_area(parent, bg=self._pal["bg"])
+        self._mount_xy_areas.append(area)
+        area.outer.pack(fill="both", expand=True)
+        content = ctk.CTkFrame(area.inner, fg_color="transparent")
         content.pack(fill="both", expand=True)
 
         panel = self._panel(content, "LOCATION")
@@ -530,6 +540,7 @@ class MountControlsFrame(ctk.CTkFrame):
             button_color=self._pal["motor_btn"],
             button_hover_color=self._pal["motor_btn_hover"],
             progress_color=self._pal["motor_btn"],
+            fg_color=self._pal["border"],
             command=self._on_rate_change,
         )
         self._rate_slider.pack(side="left", fill="x", expand=True, padx=10)
@@ -1550,6 +1561,9 @@ class MountControlsFrame(ctk.CTkFrame):
         self._pal = _mount_palette_for_camgui_theme(t)
         p = self._pal
 
+        for a in getattr(self, "_mount_xy_areas", []):
+            theme_xy_area(a, p["bg"])
+
         self.configure(fg_color=p["bg"])
         self._conn_outer.configure(fg_color=p["bg"])
         self._tabs.configure(
@@ -1576,10 +1590,12 @@ class MountControlsFrame(ctk.CTkFrame):
         for sep in self._section_separators:
             sep.configure(fg_color=p["border"])
 
+        is_day_ui = t.get("bg_primary") == "#f5f5f5"
+        entry_text = "#ffadad" if is_day_ui else p["text"]
         entry_kw = dict(
             fg_color=p["entry_bg"],
             border_color=p["border"],
-            text_color=p["text"],
+            text_color=entry_text,
         )
         for w in (
             self._lat_entry,
@@ -1598,7 +1614,7 @@ class MountControlsFrame(ctk.CTkFrame):
 
         self._log_box.configure(
             fg_color=p["entry_bg"],
-            text_color=p["text"],
+            text_color=entry_text,
             border_color=p["border"],
         )
 
@@ -1606,7 +1622,7 @@ class MountControlsFrame(ctk.CTkFrame):
             fg_color=p["entry_bg"],
             button_color=p["motor_btn"],
             button_hover_color=p["motor_btn_hover"],
-            text_color=p["text"],
+            text_color=entry_text,
         )
         try:
             self._refresh_ports_btn.configure(
@@ -1681,6 +1697,7 @@ class MountControlsFrame(ctk.CTkFrame):
             button_color=p["motor_btn"],
             button_hover_color=p["motor_btn_hover"],
             progress_color=p["motor_btn"],
+            fg_color=p["border"],
         )
         self._rate_lbl.configure(text_color=p["motor_btn"])
 
