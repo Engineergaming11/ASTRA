@@ -454,6 +454,30 @@ class ZWOCameraGUI:
                 print(
                     "Tip: The ZWO SDK needs libusb. On macOS with Homebrew run: brew install libusb"
                 )
+            if sys.platform.startswith("linux"):
+                if any(
+                    s in err
+                    for s in (
+                        "removed",
+                        "permission",
+                        "denied",
+                        "access",
+                        "libusb",
+                        "could not claim",
+                        "busy",
+                    )
+                ):
+                    print(
+                        "Tip (Linux / Raspberry Pi): ZWO cameras need udev rules + usbfs memory.\n"
+                        "  1) Plug in the camera, then run: lsusb | grep 03c3\n"
+                        "  2) Install rules: sudo install -m 0644 asi.rules /etc/udev/rules.d/asi.rules\n"
+                        "     (asi.rules ships in the ASTRA project root from the ZWO SDK layout.)\n"
+                        "  3) sudo udevadm control --reload-rules && sudo udevadm trigger\n"
+                        "  4) Verify: cat /sys/module/usbcore/parameters/usbfs_memory_mb  (expect 200)\n"
+                        "  5) Ensure libASICamera2.so matches aarch64: file libASICamera2.so\n"
+                        "  6) Quit other apps using the camera (ASICAP, INDI). Unplug/replug USB.\n"
+                        "  7) If still failing, test once with: sudo -E ./run_astra_linux.sh"
+                    )
             print("GUI will run in demo mode")
 
         self.setup_ui()

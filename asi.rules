@@ -1,0 +1,6 @@
+# ZWO ASI cameras on Linux (vendor 03c3). Install to /etc/udev/rules.d/asi.rules
+# and run: sudo udevadm control --reload-rules && sudo udevadm trigger
+#
+# Raises usbfs memory cap (many ZWO apps expect 200 MB) and allows non-root access.
+ACTION=="add", ATTR{idVendor}=="03c3", RUN+="/bin/sh -c '/bin/echo 200 >/sys/module/usbcore/parameters/usbfs_memory_mb'"
+SUBSYSTEM=="usb", ATTR{idVendor}=="03c3", MODE="0666"
