@@ -257,10 +257,27 @@ def _installed_index_scales(data_dir: Path) -> set[int]:
     return scales
 
 
-def run_solve_field_local(image_path, ra, dec, fov_deg, out_basename, solve_field_cmd=SOLVE_FIELD_CMD, timeout=300):
-    """Run local astrometry.net solve-field with robust fallbacks."""
+def run_solve_field_local(
+    image_path,
+    ra,
+    dec,
+    fov_deg,
+    out_basename,
+    solve_field_cmd=SOLVE_FIELD_CMD,
+    timeout=300,
+    output_dir=None,
+):
+    """Run local astrometry.net solve-field with robust fallbacks.
+
+    If ``output_dir`` is set, astrometry logs and FITS products are written there
+    (the input image may live elsewhere). Otherwise outputs stay next to the image.
+    """
     image_path = Path(image_path).resolve()
-    out_dir = image_path.parent
+    out_dir = Path(output_dir).resolve() if output_dir else image_path.parent
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
     out_basename_path = out_dir / out_basename
     setup_info = ensure_astrometry_runtime_setup()
     setup_log = "\n".join(setup_info.get("messages", []))

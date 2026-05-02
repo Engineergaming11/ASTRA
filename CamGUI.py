@@ -250,6 +250,12 @@ PLATE_SOLVE_TELESCOPE_MENU_LABELS = (
 PLATE_SOLVE_REFRACTOR_4IN_LABEL = '4" Refractor'
 PLATE_SOLVE_REFRACTOR_4IN_FOCAL_MM = 660.0
 
+# Session layout: captures use ``save_path/<session>/<frame_type>/``; plate-solve products go under
+# ``save_path/<session>/plate_solve/`` to keep astrometry clutter off the camera folder (Pi storage).
+SESSION_PLATE_SUBDIR = "plate_solve"
+SESSION_CAPTURE_PNG_COMPRESSION = 9
+MAX_VIDEO_RECORD_SECONDS = 2.0
+
 
 def _compute_plate_scale_arcsec_per_px(pixel_size_um: float, focal_length_mm: float) -> float:
     """Plate scale in arcsec/pixel from pixel size (μm) and focal length (mm)."""
@@ -407,6 +413,8 @@ class ZWOCameraGUI:
         self.is_capturing = False
         self.is_recording = False
         self.video_writer = None
+        self._recording_deadline = 0.0
+        self._recording_auto_stop_sent = False
         self.available_cameras = []
         self.camera_initialized = False
 
@@ -435,7 +443,7 @@ class ZWOCameraGUI:
         self._last_solve_ra_deg = None
         self._last_solve_dec_deg = None
         self._last_plate_solve_input_path = None
-        # In-app session captures for Session photos tab (fits_path, captured_at iso, ra/dec if solved)
+        # Session photos tab: ``fits_path`` is the primary capture file path (PNG or FITS), plus timestamps / solved RA Dec
         self._session_photos = []
         # Focus assistant state (camera-side Focus tab). Samples are dicts with
         # keys: index, position, score (higher better), kind ("hfr"/"laplacian"),
@@ -886,6 +894,43 @@ class ZWOCameraGUI:
                 )
         except Exception as e:
             print(f"Site settings save error: {e}")
+
+    def _session_root_dir(self) -> str:
+        """Directory for the current session name (``save_path`` only if name is empty)."""
+        try:
+            p = self.project_name_entry.get().strip()
+        except Exception:
+            p = ""
+        return os.path.join(self.save_path, p) if p else self.save_path
+
+    def _session_plate_solve_dir(self) -> str:
+        """Per-session folder for astrometry outputs (keeps plate-solve clutter out of Light/)."""
+        d = os.path.join(self._session_root_dir(), SESSION_PLATE_SUBDIR)
+        try:
+            os.makedirs(d, exist_ok=True)
+        except OSError:
+            pass
+        return d
+
+    @staticmethod
+    def _cleanup_plate_solve_intermediates(out_basename_path_str: str) -> None:
+        """Delete solve-field sidecars, retaining only ``<prefix>.new.fits`` (solved WCS)."""
+        p = Path(out_basename_path_str)
+        parent, prefix = p.parent, p.name
+        if not parent.is_dir() or not prefix:
+            return
+        keep = prefix + ".new.fits"
+        for child in list(parent.iterdir()):
+            try:
+                if not child.is_file():
+                    continue
+                name = child.name
+                if name == keep:
+                    continue
+                if name.startswith(prefix + ".") or name.startswith(prefix + "-"):
+                    child.unlink()
+            except OSError:
+                continue
 
     # ── Equipment preset (telescope + camera) ──────────────────────────────
     def _load_astro_preset(self):
@@ -3514,7 +3559,7 @@ class ZWOCameraGUI:
             self._session_listbox.insert(tk.END, self._session_line_for_record(rec))
 
     def _backfill_session_radec_from_disk(self):
-        """Fill RA/Dec from astrometry outputs (*-astra*.fits) next to session captures."""
+        """Fill RA/Dec from astrometry ``*-astra*.fits`` next to captures or under ``plate_solve/``."""
         updated = 0
         for rec in self._session_photos:
             if rec.get("ra_deg") is not None:
@@ -3553,7 +3598,7 @@ class ZWOCameraGUI:
         self._plate_path_entry.delete(0, "end")
         self._plate_path_entry.insert(0, path)
         self._focus_center_tab("Plate solve")
-        self.update_status("FITS path copied — open Plate solve")
+        self.update_status("Image path copied — open Plate solve")
 
     def _session_use_last_for_plate(self):
         if not self._session_photos:
@@ -3566,7 +3611,7 @@ class ZWOCameraGUI:
         self._plate_path_entry.delete(0, "end")
         self._plate_path_entry.insert(0, path)
         self._focus_center_tab("Plate solve")
-        self.update_status("Last capture copied — open Plate solve")
+        self.update_status("Last capture path copied — open Plate solve")
 
     def _update_session_photo_solved(self, fits_input_path: str, ra_deg: float, dec_deg: float):
         """Attach solved coordinates to a session list entry when paths match."""
@@ -3585,17 +3630,28 @@ class ZWOCameraGUI:
                 break
         self._refresh_session_photos_listbox()
 
-    def _find_solved_fits_for_capture(self, fits_input_path: str) -> str | None:
-        """Find a solved astrometry FITS file generated from a capture FITS."""
-        if not fits_input_path:
+    def _find_solved_fits_for_capture(self, capture_input_path: str) -> str | None:
+        """Find solved astrometry ``*-astra*.fits`` next to the capture or in ``plate_solve/``."""
+        if not capture_input_path:
             return None
-        p = Path(fits_input_path)
-        if not p.parent.exists():
-            return None
-        candidates = sorted(p.parent.glob(p.stem + "-astra*.fits"))
-        for cand in candidates:
-            if cand.is_file():
-                return str(cand)
+        p = Path(capture_input_path)
+        stems = [p.stem]
+        if p.stem.endswith("_debayered"):
+            stems.append(p.stem[: -len("_debayered")])
+        search_dirs: list[Path] = [p.parent]
+        try:
+            plat = Path(self._session_plate_solve_dir())
+            if plat.resolve() != p.parent.resolve():
+                search_dirs.append(plat)
+        except Exception:
+            pass
+        for stem in stems:
+            for d in search_dirs:
+                if not d.exists():
+                    continue
+                for cand in sorted(d.glob(stem + "-astra*.fits")):
+                    if cand.is_file():
+                        return str(cand)
         return None
 
     def _generate_session_pdf_report(self):
@@ -3885,10 +3941,20 @@ class ZWOCameraGUI:
         self._plate_out.see(tk.END)
         self._set_plate_solve_busy(True, "Solving...")
 
+        plate_out = self._session_plate_solve_dir()
+
         def worker():
             base = Path(path).stem + "-astra"
             try:
-                res = run_solve_field_local(path, ra, dec, fov, out_basename=base, timeout=400)
+                res = run_solve_field_local(
+                    path,
+                    ra,
+                    dec,
+                    fov,
+                    out_basename=base,
+                    timeout=400,
+                    output_dir=plate_out,
+                )
             except Exception as e:
                 self.root.after(0, lambda err=str(e): self._plate_solve_done(None, err))
                 return
@@ -4119,6 +4185,9 @@ class ZWOCameraGUI:
                 )
             except Exception as e:
                 self._plate_out.insert(tk.END, f"Offline annotation skipped: {e}\n")
+            ob = res.get("out_basename")
+            if isinstance(ob, str) and ob:
+                self._cleanup_plate_solve_intermediates(ob)
         self._plate_out.see(tk.END)
 
     @staticmethod
@@ -4365,7 +4434,10 @@ class ZWOCameraGUI:
         base_path = Path(input_image_path) if input_image_path else Path(solved_fits_path)
         out_path = base_path.with_name(base_path.stem + "-astra-facts.png")
         try:
-            img_pil.save(str(out_path))
+            try:
+                img_pil.save(str(out_path), compress_level=6, optimize=True)
+            except TypeError:
+                img_pil.save(str(out_path))
             if log_to_plate and getattr(self, "_plate_out", None):
                 self._plate_out.insert(tk.END, f"Annotated image saved: {out_path}\n")
                 self._plate_out.insert(
@@ -5658,7 +5730,19 @@ class ZWOCameraGUI:
                         img = frame
 
                     if self.is_recording and self.video_writer:
-                        self.video_writer.write(img)
+                        self.video_writer.write(cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+                        dl = getattr(self, "_recording_deadline", 0.0)
+                        if (
+                            dl
+                            and time.monotonic() >= dl
+                            and not getattr(self, "_recording_auto_stop_sent", False)
+                        ):
+                            self._recording_auto_stop_sent = True
+                            self._recording_deadline = 0.0
+                            self.root.after(
+                                0,
+                                lambda: self.stop_recording(notify=True, auto_max_duration=True),
+                            )
 
                     # Cache the latest full-resolution RGB frame for the Focus
                     # assistant. Copy() so subsequent buffer reuse by the SDK
@@ -5806,67 +5890,51 @@ class ZWOCameraGUI:
                     'exposure_display': exposure_display,
                     'exposure_s': exposure_s,
                     'gain': gain_val,
-                    'temperature_c': temp
+                    'temperature_c': temp,
+                    'saved_as': 'PNG (debayered 8-bit, zlib-compressed)',
                 }
 
                 print(f"Capture metadata for image {img_num}:")
                 for key, value in metadata.items():
                     print(f"  {key}: {value}")
 
-                fits_filename = f"image_{img_num:03d}_{timestamp}_{current_format}.fits"
-                fits_filepath = os.path.join(capture_path, fits_filename)
-
-                msg_save = f"Saving FITS {img_num}/{capture_count}..."
+                msg_save = f"Saving PNG {img_num}/{capture_count}..."
                 self.root.after(0, lambda m=msg_save: (self.update_status(m), self.busy_text_label.configure(text=m)))
 
-                header = fits.Header()
-                header['INSTRUME'] = self.camera_info['Name']
-                header['EXPOSURE'] = (exposure_s, 'Exposure time in seconds')
-                header['GAIN'] = (gain_val, 'Gain value')
-                header['BINNING'] = (bin_value, 'Binning factor')
-                header['XBINNING'] = (bin_value, 'X-axis binning')
-                header['YBINNING'] = (bin_value, 'Y-axis binning')
-                header['XPIXSZ'] = (2.9, 'Pixel size in microns (unbinned)')
-                header['YPIXSZ'] = (2.9, 'Pixel size in microns (unbinned)')
-                header['IMAGETYP'] = ('Light Frame', 'Type of image')
-                header['BAYERPAT'] = ('RGGB', 'Bayer pattern')
-                header['COLORTYP'] = ('RGGB', 'Color type')
-                header['DATE-OBS'] = (datetime.now().isoformat(), 'Date of observation')
-                header['IMGNUM'] = (img_num, f'Image number in sequence of {capture_count}')
-                header['BITDEPTH'] = (metadata['bit_depth'], 'Bit depth')
-                if temp is not None:
-                    header['CCD-TEMP'] = (temp, 'CCD temperature in Celsius')
+                if len(frame.shape) == 3 and frame.shape[2] == 3:
+                    debayered = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                elif len(frame.shape) == 2 or (len(frame.shape) == 3 and frame.shape[2] == 1):
+                    frame_2d = frame if len(frame.shape) == 2 else frame.reshape(frame.shape[0], frame.shape[1])
+                    if current_format == "RAW16":
+                        frame_8bit = (frame_2d / 256).astype(np.uint8)
+                        debayered = cv2.cvtColor(frame_8bit, cv2.COLOR_BayerRG2RGB)
+                    elif current_format == "RAW8":
+                        debayered = cv2.cvtColor(frame_2d, cv2.COLOR_BayerRG2RGB)
+                    else:
+                        debayered = cv2.cvtColor(frame_2d, cv2.COLOR_GRAY2RGB)
+                else:
+                    debayered = cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
 
-                hdu = fits.PrimaryHDU(data=frame, header=header)
-                hdu.writeto(fits_filepath, overwrite=True)
+                png_filename = f"image_{img_num:03d}_{timestamp}_debayered.png"
+                png_filepath = os.path.join(capture_path, png_filename)
+                bgr = cv2.cvtColor(debayered, cv2.COLOR_RGB2BGR)
+                cv2.imwrite(
+                    png_filepath,
+                    bgr,
+                    [cv2.IMWRITE_PNG_COMPRESSION, SESSION_CAPTURE_PNG_COMPRESSION],
+                )
 
-                print(f"Saved FITS file: {fits_filepath}")
+                print(f"Saved PNG file: {png_filepath}")
                 self._session_photos.append(
                     {
-                        "fits_path": os.path.abspath(fits_filepath),
+                        "fits_path": os.path.abspath(png_filepath),
                         "captured_at": metadata["datetime"],
                         "ra_deg": None,
                         "dec_deg": None,
                     }
                 )
                 self.root.after(0, self._refresh_session_photos_listbox)
-                all_saved_files.append(fits_filename)
-
-                if current_format == "RAW8":
-                    msg_png = f"Creating PNG {img_num}/{capture_count}..."
-                    self.root.after(0, lambda m=msg_png: (self.update_status(m), self.busy_text_label.configure(text=m)))
-
-                    if len(frame.shape) == 2 or (len(frame.shape) == 3 and frame.shape[2] == 1):
-                        debayered = cv2.cvtColor(frame, cv2.COLOR_BayerRG2RGB)
-                    else:
-                        debayered = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-                    png_filename = f"image_{img_num:03d}_{timestamp}_debayered.png"
-                    png_filepath = os.path.join(capture_path, png_filename)
-                    cv2.imwrite(png_filepath, cv2.cvtColor(debayered, cv2.COLOR_RGB2BGR))
-
-                    print(f"Saved debayered PNG: {png_filepath}")
-                    all_saved_files.append(png_filename)
+                all_saved_files.append(png_filename)
 
                 metadata_filename = f"image_{img_num:03d}_{timestamp}_metadata.txt"
                 metadata_filepath = os.path.join(capture_path, metadata_filename)
@@ -5879,11 +5947,12 @@ class ZWOCameraGUI:
                     for key, value in [
                         ('Image Number', f"{metadata['image_number']} of {metadata['total_images']}"),
                         ('Camera', metadata['camera']),
-                        ('Format', metadata['format']),
+                        ('Sensor format', metadata['format']),
+                        ('Saved file', metadata['saved_as']),
                         ('Timestamp', metadata['datetime']),
                         ('Resolution', metadata['resolution']),
                         ('Binning', f"{metadata['bins']}x{metadata['bins']}"),
-                        ('Bit Depth', metadata['bit_depth']),
+                        ('Bit Depth (sensor)', metadata['bit_depth']),
                         ('Data Type', metadata['dtype']),
                         ('Buffer Size', f"{metadata['buffer_size']} bytes"),
                         ('Array Shape', metadata['shape']),
@@ -5898,9 +5967,7 @@ class ZWOCameraGUI:
                     f.write("\n" + "=" * 60 + "\n")
                     f.write("FILES FOR THIS IMAGE\n")
                     f.write("=" * 60 + "\n\n")
-                    f.write(f"  - {fits_filename}\n")
-                    if current_format == "RAW8":
-                        f.write(f"  - {png_filename}\n")
+                    f.write(f"  - {png_filename}\n")
                     f.write(f"  - {metadata_filename}\n")
 
                 print(f"Saved metadata: {metadata_filepath}")
@@ -5918,7 +5985,8 @@ class ZWOCameraGUI:
                 for key, value in [
                     ('Session ID', session_timestamp),
                     ('Total Images', capture_count),
-                    ('Format', current_format),
+                    ('Sensor format', current_format),
+                    ('Saved images', 'PNG debayered (zlib compression)'),
                     ('Camera', self.camera_info['Name']),
                     ('Session Started', session_timestamp),
                     ('Exposure', exposure_display),
@@ -5938,14 +6006,10 @@ class ZWOCameraGUI:
             print(f"\nSaved session summary: {summary_filepath}")
 
             done_msg = f"Completed: {capture_count} images saved to {capture_path}"
-            files_description = (
-                "- FITS file\n- PNG file (debayered)\n- Metadata file"
-                if current_format == "RAW8"
-                else "- FITS file\n- Metadata file"
-            )
+            files_description = "- PNG (debayered, compressed)\n- Metadata text file"
             success_msg = (
                 f"Capture session completed!\n\n"
-                f"Format: {current_format}\n"
+                f"Sensor mode: {current_format} (saved as compressed PNG)\n"
                 f"Images captured: {capture_count}\n"
                 f"Folder:\n{capture_path}\n\n"
                 f"Files per image:\n{files_description}\n\n"
@@ -6023,21 +6087,38 @@ class ZWOCameraGUI:
             self.video_writer = cv2.VideoWriter(filepath, fourcc, fps, (width, height))
 
             self.is_recording = True
+            self._recording_auto_stop_sent = False
+            self._recording_deadline = time.monotonic() + MAX_VIDEO_RECORD_SECONDS
             self.record_video_btn.configure(text="Stop Recording")
-            self.update_status(f"Recording to: {filename} @ {fps:.1f} FPS")
+            self.update_status(
+                f"Recording to: {filename} @ {fps:.1f} FPS (max {MAX_VIDEO_RECORD_SECONDS:.0f}s)"
+            )
 
         except Exception as e:
             messagebox.showerror("Error", f"Failed to start recording: {e}")
 
-    def stop_recording(self):
+    def stop_recording(self, notify=True, auto_max_duration=False):
         try:
+            self._recording_deadline = 0.0
+            self._recording_auto_stop_sent = False
             self.is_recording = False
             if self.video_writer:
                 self.video_writer.release()
                 self.video_writer = None
             self.record_video_btn.configure(text="Start Recording")
-            self.update_status("Recording stopped")
-            messagebox.showinfo("Success", "Video saved successfully")
+            if auto_max_duration:
+                self.update_status("Recording stopped — 2 s limit (storage guard)")
+            else:
+                self.update_status("Recording stopped")
+            if notify:
+                if auto_max_duration:
+                    messagebox.showinfo(
+                        "Recording limit",
+                        f"Video saved. Recording stops automatically after {MAX_VIDEO_RECORD_SECONDS:.0f} "
+                        "seconds to limit file size on small devices.",
+                    )
+                else:
+                    messagebox.showinfo("Success", "Video saved successfully")
         except Exception as e:
             self.update_status(f"Error stopping recording: {e}")
 
