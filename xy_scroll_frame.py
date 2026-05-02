@@ -18,6 +18,7 @@ class XYScrollArea:
     vsb: tk.Scrollbar
     hsb: tk.Scrollbar
     corner: tk.Frame
+    inner_window_id: int
 
 
 def _is_descendant(widget: tk.Misc | None, ancestor: tk.Misc | None) -> bool:
@@ -54,7 +55,7 @@ def create_xy_scroll_area(parent: tk.Misc, *, bg: str = "#f0f0f0") -> XYScrollAr
     inner = tk.Frame(canvas, bg=bg)
     corner = tk.Frame(outer, bg=bg, width=17, height=17)
 
-    canvas.create_window((0, 0), window=inner, anchor="nw")
+    inner_window_id = canvas.create_window((0, 0), window=inner, anchor="nw")
 
     def _update_scrollregion(_event=None):
         canvas.update_idletasks()
@@ -62,6 +63,21 @@ def create_xy_scroll_area(parent: tk.Misc, *, bg: str = "#f0f0f0") -> XYScrollAr
         if bbox:
             canvas.configure(scrollregion=bbox)
 
+    def _fit_inner_width(_event: tk.Event | None = None):
+        """Match inner width to the canvas viewport so ``fill='x'`` layouts use the visible width."""
+        try:
+            cw = int(canvas.winfo_width())
+        except tk.TclError:
+            return
+        if cw <= 1:
+            return
+        try:
+            canvas.itemconfigure(inner_window_id, width=cw)
+        except tk.TclError:
+            return
+        _update_scrollregion()
+
+    canvas.bind("<Configure>", lambda e: _fit_inner_width())
     inner.bind("<Configure>", lambda e: _update_scrollregion())
 
     canvas.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
@@ -78,6 +94,7 @@ def create_xy_scroll_area(parent: tk.Misc, *, bg: str = "#f0f0f0") -> XYScrollAr
         vsb=vsb,
         hsb=hsb,
         corner=corner,
+        inner_window_id=inner_window_id,
     )
 
 

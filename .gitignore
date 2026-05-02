@@ -7,3 +7,6 @@ __pycache__/
 # Large data / ephemeris — download separately (exceed GitHub size limits)
 de440.bsp
 UpdatedTycho2.parquet
+
+# Nested clone / snapshot — not part of the main tree (would record as gitlink only)
+offline_bundle/project/

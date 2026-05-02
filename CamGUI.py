@@ -350,8 +350,10 @@ def _resolve_target_name(name: str) -> tuple[float, float] | None:
     return None
 
 
-# When False, skip the Session and daytime Sun dialogs on launch; main GUI opens directly.
+# When False, skip the wedge/solar safety Session dialog on launch (see also SHOW_SESSION_ID_DIALOG).
 SHOW_SESSION_STARTUP_DIALOG = False
+# When True, prompt once at launch for session name (Camera tab) and telescope (Plate solve preset).
+SHOW_SESSION_ID_DIALOG = True
 SETUP_TARGET_BRIGHT_STARS = "Main bright stars in Tucson"
 SETUP_TARGET_MOON = "Moon"
 SETUP_TARGET_CONSTELLATIONS = "Constellations"
@@ -546,16 +548,188 @@ class ZWOCameraGUI:
 
         if SHOW_SESSION_STARTUP_DIALOG:
             self.viewing_mode = None
-            self.root.after(100, self._show_session_startup_dialog)
         else:
             self.viewing_mode = "night"
             self.wedge_acknowledged = True
             self._apply_mode_settings(night_mode=True, image_format="RAW8")
 
+        if SHOW_SESSION_ID_DIALOG:
+            self.root.after(100, self._kickoff_session_identity_dialog)
+        elif SHOW_SESSION_STARTUP_DIALOG:
+            self.root.after(100, self._show_session_startup_dialog)
+
         # Auto-select first camera if available
         if self.available_cameras:
             self.camera_select_var.set(f"{self.available_cameras[0][0]}: {self.available_cameras[0][1]}")
             self.connect_camera()
+
+    def _kickoff_session_identity_dialog(self):
+        self._show_session_identity_dialog()
+
+    def _apply_session_startup_telescope_choice(self, choice: str, other_label: str) -> None:
+        """Apply SCT, refractor, or custom telescope from the session dialog (plate preset + UI)."""
+        labels = PLATE_SOLVE_TELESCOPE_MENU_LABELS
+        if choice == labels[0]:
+            self.astro_preset.setdefault("telescope", {}).update(
+                {
+                    "label": str(DEFAULT_ASTRO_PRESET["telescope"]["label"]),
+                    "focal_length_mm": float(DEFAULT_ASTRO_PRESET["telescope"]["focal_length_mm"]),
+                }
+            )
+        elif choice == labels[1]:
+            self.astro_preset.setdefault("telescope", {}).update(
+                {
+                    "label": PLATE_SOLVE_REFRACTOR_4IN_LABEL,
+                    "focal_length_mm": float(PLATE_SOLVE_REFRACTOR_4IN_FOCAL_MM),
+                }
+            )
+        else:
+            custom = (other_label or "").strip()
+            if custom:
+                self.astro_preset.setdefault("telescope", {})["label"] = custom
+        self._apply_astro_preset_to_ui()
+        self._recompute_preset_metrics()
+
+    def _show_session_identity_dialog(self):
+        """Prompt for session folder name and telescope; fills Camera + Plate solve preset."""
+        dlg = ctk.CTkToplevel(self.root)
+        dlg.title("Session")
+        dlg.geometry("480x380")
+        dlg.resizable(False, False)
+        dlg.grab_set()
+        dlg.transient(self.root)
+
+        self.root.update_idletasks()
+        w, h = 480, 380
+        x = self.root.winfo_x() + (self.root.winfo_width() // 2) - w // 2
+        y = self.root.winfo_y() + (self.root.winfo_height() // 2) - h // 2
+        dlg.geometry(f"{w}x{h}+{x}+{y}")
+
+        ctk.CTkLabel(dlg, text="Welcome to ASTRA", font=("Segoe UI", 18, "bold")).pack(
+            pady=(18, 4)
+        )
+        ctk.CTkLabel(
+            dlg,
+            text="Set a session name and telescope for this run. These fill the Camera tab "
+            "and the Plate solve equipment fields (you can edit them later).",
+            font=("Segoe UI", 11),
+            text_color=("gray35", "gray60"),
+            wraplength=430,
+            justify="left",
+        ).pack(padx=20, pady=(0, 12), anchor="w")
+
+        scope = self.astro_preset.get("telescope", {}) or {}
+        default_session = datetime.now().strftime("session_%Y%m%d_%H%M")
+        labels = PLATE_SOLVE_TELESCOPE_MENU_LABELS
+
+        ctk.CTkLabel(dlg, text="Session name", font=("Segoe UI", 12, "bold")).pack(
+            anchor="w", padx=24, pady=(4, 2)
+        )
+        session_entry = ctk.CTkEntry(
+            dlg,
+            width=400,
+            height=32,
+            font=("Segoe UI", 11),
+            placeholder_text="Folder name under your save path (optional)",
+        )
+        session_entry.pack(padx=24, pady=(0, 10))
+        session_entry.insert(0, default_session)
+
+        ctk.CTkLabel(dlg, text="Telescope", font=("Segoe UI", 12, "bold")).pack(
+            anchor="w", padx=24, pady=(4, 2)
+        )
+        telescope_combo = ctk.CTkComboBox(
+            dlg,
+            values=list(labels),
+            width=400,
+            height=32,
+            font=("Segoe UI", 11),
+            state="readonly",
+            button_color="#0b5c8f",
+            button_hover_color="#1a7ab5",
+            dropdown_hover_color="#e8e8e8",
+        )
+        telescope_combo.pack(padx=24, pady=(0, 6))
+        try:
+            f_mm = float(scope.get("focal_length_mm", 0) or 0)
+        except Exception:
+            f_mm = 0.0
+        sct_f = float(DEFAULT_ASTRO_PRESET["telescope"]["focal_length_mm"])
+        if abs(f_mm - sct_f) < 0.5:
+            telescope_combo.set(labels[0])
+        elif abs(f_mm - PLATE_SOLVE_REFRACTOR_4IN_FOCAL_MM) < 0.5:
+            telescope_combo.set(labels[1])
+        else:
+            telescope_combo.set(labels[2])
+
+        other_wrap = ctk.CTkFrame(dlg, fg_color="transparent")
+        ctk.CTkLabel(
+            other_wrap,
+            text="Other telescope name",
+            font=("Segoe UI", 10),
+            text_color=("gray35", "gray60"),
+        ).pack(anchor="w", pady=(0, 2))
+        other_entry = ctk.CTkEntry(
+            other_wrap,
+            width=400,
+            height=30,
+            font=("Segoe UI", 11),
+            placeholder_text="Used when “Different telescope” is selected",
+        )
+        other_entry.pack(anchor="w")
+
+        def _sync_other_visibility(_choice: str | None = None):
+            sel = telescope_combo.get()
+            if sel == labels[2]:
+                other_wrap.pack(fill=tk.X, padx=24, pady=(0, 8), anchor="w", after=telescope_combo)
+                prev = str(scope.get("label", "") or "")
+                if prev and prev not in (
+                    str(DEFAULT_ASTRO_PRESET["telescope"]["label"]),
+                    PLATE_SOLVE_REFRACTOR_4IN_LABEL,
+                ):
+                    try:
+                        if not other_entry.get().strip():
+                            other_entry.delete(0, "end")
+                            other_entry.insert(0, prev)
+                    except tk.TclError:
+                        pass
+            else:
+                other_wrap.pack_forget()
+
+        telescope_combo.configure(command=_sync_other_visibility)
+        _sync_other_visibility()
+
+        def apply_and_close():
+            sn = session_entry.get().strip()
+            try:
+                if getattr(self, "project_name_entry", None):
+                    self.project_name_entry.delete(0, "end")
+                    if sn:
+                        self.project_name_entry.insert(0, sn)
+            except tk.TclError:
+                pass
+            self._apply_session_startup_telescope_choice(
+                telescope_combo.get(),
+                other_entry.get(),
+            )
+            dlg.destroy()
+            if SHOW_SESSION_STARTUP_DIALOG:
+                self.root.after(50, self._show_session_startup_dialog)
+
+        bf = ctk.CTkFrame(dlg, fg_color="transparent")
+        bf.pack(side=tk.BOTTOM, pady=(0, 18))
+        ctk.CTkButton(
+            bf,
+            text="Continue",
+            command=apply_and_close,
+            width=200,
+            height=40,
+            font=("Segoe UI", 12, "bold"),
+            fg_color="#0b5c8f",
+            hover_color="#1a7ab5",
+        ).pack()
+
+        dlg.protocol("WM_DELETE_WINDOW", apply_and_close)
 
     def _show_session_startup_dialog(self):
         """Single startup window: mode, safety confirmations, and workflow tips."""
@@ -1362,9 +1536,9 @@ class ZWOCameraGUI:
         )
         self.browse_btn.pack(side=tk.LEFT, padx=(4, 0))
 
-        # PROJECT NAME
+        # SESSION NAME (capture subfolder under save path; same as startup "session" prompt)
         tk.Label(
-            camera_parent, text="Project Name:", font=("Segoe UI", 9)
+            camera_parent, text="Session name:", font=("Segoe UI", 9)
         ).pack(anchor="w", pady=(8, 0))
 
         self.project_name_entry = ctk.CTkEntry(
@@ -1377,7 +1551,7 @@ class ZWOCameraGUI:
             border_color="#cccccc",
             border_width=1,
             corner_radius=6,
-            placeholder_text="e.g. Jupiter_2026"
+            placeholder_text="e.g. M42_20260502"
         )
         self.project_name_entry.pack(fill=tk.X, pady=4)
 

@@ -7,8 +7,8 @@
     "elev_m": 728.0
   },
   "telescope": {
-    "label": "8\" Schmidt-Cassegrain",
-    "focal_length_mm": 2032.0
+    "label": "4\" Refractor",
+    "focal_length_mm": 660.0
   },
   "camera": {
     "label": "ZWO ASI585MC",

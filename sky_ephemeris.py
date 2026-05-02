@@ -18,12 +18,25 @@ from offline_star_facts import OFFLINE_STAR_FACTS
 
 _BASE = Path(__file__).resolve().parent
 
+
+def _resolve_tycho_parquet_path() -> Path:
+    """Tycho-2 subset is a large bundled file (not in git). Accept either common spellings."""
+    for name in ("updatedTycho2.parquet", "UpdatedTycho2.parquet"):
+        p = _BASE / name
+        if p.is_file():
+            return p
+    raise FileNotFoundError(
+        f"Missing Tycho-2 catalog in {_BASE}: add updatedTycho2.parquet or "
+        "UpdatedTycho2.parquet next to sky_ephemeris.py (copy from your dev machine or release bundle)."
+    )
+
+
 # Default site (University of Arizona Steward) — used when no GPS/session site.
 DEFAULT_LAT = 32.2329
 DEFAULT_LON = -110.9479
 DEFAULT_ELEV_M = 728.0
 
-catalog = pd.read_parquet(_BASE / "updatedTycho2.parquet")
+catalog = pd.read_parquet(_resolve_tycho_parquet_path())
 messier_catalog = pd.read_parquet(_BASE / "Messier_Updated.parquet")
 
 # Lazy-built unit vectors for fast nearest Tycho match (plate-solve annotations).
