@@ -25,6 +25,7 @@ from ioptron_mount import (
     _parse_ra_input,
 )
 from sky_ephemeris import radec_to_altaz_deg, sun_apparent_radec_deg
+from ui_display_profile import ui_compact
 from xy_scroll_frame import create_xy_scroll_area, theme_xy_area
 
 import motor_rgb_led
@@ -144,6 +145,10 @@ class MountControlsFrame(ctk.CTkFrame):
         self._nudge_cmd_queue = queue.Queue()
         self._nudge_worker_thread: Optional[threading.Thread] = None
         self._mount_xy_areas: list = []
+        # Compact = small Pi display OR embedded into a narrow side column.
+        # Stacked rows + tighter padding make every control reachable without
+        # horizontal scrolling at any width down to ~240 px.
+        self._compact = ui_compact(self) or not standalone
 
         self._build_ui()
         self._refresh_ports()
@@ -154,8 +159,10 @@ class MountControlsFrame(ctk.CTkFrame):
         self._build_header()
 
         # Connection always visible above mount tabs
+        _outer_padx = 6 if self._compact else 8
+        _outer_pady_btm = 4 if self._compact else 6
         self._conn_outer = ctk.CTkFrame(self, fg_color=self._pal["bg"])
-        self._conn_outer.pack(fill="x", padx=8, pady=(0, 6))
+        self._conn_outer.pack(fill="x", padx=_outer_padx, pady=(0, _outer_pady_btm))
         self._build_connection_panel(self._conn_outer)
 
         self._tabs = ctk.CTkTabview(
@@ -168,7 +175,11 @@ class MountControlsFrame(ctk.CTkFrame):
             segmented_button_unselected_hover_color=self._pal["border"],
             text_color=self._pal["text"],
         )
-        self._tabs.pack(fill="both", expand=True, padx=6, pady=(0, 8))
+        self._tabs.pack(
+            fill="both", expand=True,
+            padx=4 if self._compact else 6,
+            pady=(0, 6 if self._compact else 8),
+        )
         self._tabs.add("Manual")
         self._tabs.add("Auto tracking")
         self._tabs.add("Setup")
@@ -216,49 +227,27 @@ class MountControlsFrame(ctk.CTkFrame):
 
         panel = self._panel(content, "LOCATION")
 
-        # Latitude row
-        lat_row = ctk.CTkFrame(panel, fg_color="transparent")
-        lat_row.pack(fill="x", pady=(0, 8))
-        ctk.CTkLabel(lat_row, text="Latitude",
-                     text_color=self._pal["muted"],
-                     font=ctk.CTkFont(size=13), width=80, anchor="w",
-                     ).pack(side="left")
-        ctk.CTkLabel(lat_row, text="(±DD.dddd  or  ±DD:MM:SS   N=+)",
-                     text_color=self._pal["muted"],
-                     font=ctk.CTkFont(size=11), anchor="w",
-                     ).pack(side="left", padx=(4, 0))
-        self._lat_entry = ctk.CTkEntry(
-            lat_row, width=180,
-            fg_color=self._pal["entry_bg"], border_color=self._pal["border"],
-            text_color=self._pal["text"], placeholder_text="e.g. 32:13:00",
+        self._lat_entry = self._stacked_form_row(
+            panel,
+            label="Latitude",
+            hint="±DD.dddd  or  ±DD:MM:SS   (N = +)",
+            placeholder="e.g. 32:13:00",
+            pady=(0, 8),
         )
-        self._lat_entry.pack(side="right")
-
-        # Longitude row
-        lon_row = ctk.CTkFrame(panel, fg_color="transparent")
-        lon_row.pack(fill="x", pady=(0, 16))
-        ctk.CTkLabel(lon_row, text="Longitude",
-                     text_color=self._pal["muted"],
-                     font=ctk.CTkFont(size=13), width=80, anchor="w",
-                     ).pack(side="left")
-        ctk.CTkLabel(lon_row, text="(±DDD.dddd  or  ±DDD:MM:SS  E=+)",
-                     text_color=self._pal["muted"],
-                     font=ctk.CTkFont(size=11), anchor="w",
-                     ).pack(side="left", padx=(4, 0))
-        self._lon_entry = ctk.CTkEntry(
-            lon_row, width=180,
-            fg_color=self._pal["entry_bg"], border_color=self._pal["border"],
-            text_color=self._pal["text"], placeholder_text="e.g. -110:56:00",
+        self._lon_entry = self._stacked_form_row(
+            panel,
+            label="Longitude",
+            hint="±DDD.dddd  or  ±DDD:MM:SS  (E = +)",
+            placeholder="e.g. -110:56:00",
+            pady=(0, 12),
         )
-        self._lon_entry.pack(side="right")
 
-        # Set button
         self._set_location_btn = ctk.CTkButton(
-            panel, text="Set Lat/Long",
-            height=40, corner_radius=8,
+            panel, text="Set Lat / Long",
+            height=38 if self._compact else 40, corner_radius=8,
             fg_color=self._pal["motor_btn"], hover_color=self._pal["motor_btn_hover"],
             text_color="#ffffff",
-            font=ctk.CTkFont(size=14, weight="bold"),
+            font=ctk.CTkFont(size=13 if self._compact else 14, weight="bold"),
             command=self._set_location,
         )
         self._set_location_btn.pack(fill="x")
@@ -267,87 +256,63 @@ class MountControlsFrame(ctk.CTkFrame):
         self._build_goto_panel(content)
 
         # ── Plate Solve Calibration panel ──────────────────────────────────────
-        ps_panel = self._panel(content, "PLATE SOLVE CALIBRATION  —  :SRA / :Sd / :CM")
+        ps_panel = self._panel(content, "PLATE SOLVE CALIBRATION")
 
-        # RA row
-        ps_ra_row = ctk.CTkFrame(ps_panel, fg_color="transparent")
-        ps_ra_row.pack(fill="x", pady=(0, 8))
-        ctk.CTkLabel(ps_ra_row, text="Target RA",
-                     text_color=self._pal["muted"],
-                     font=ctk.CTkFont(size=13), width=90, anchor="w",
-                     ).pack(side="left")
-        ctk.CTkLabel(ps_ra_row, text="(HH:MM:SS  or  decimal °)",
-                     text_color=self._pal["muted"],
-                     font=ctk.CTkFont(size=11), anchor="w",
-                     ).pack(side="left", padx=(4, 0))
-        self._ps_ra_entry = ctk.CTkEntry(
-            ps_ra_row, width=180,
-            fg_color=self._pal["entry_bg"], border_color=self._pal["border"],
-            text_color=self._pal["text"], placeholder_text="e.g. 05:34:32",
+        self._ps_ra_entry = self._stacked_form_row(
+            ps_panel,
+            label="Target RA",
+            hint="HH:MM:SS  or  decimal degrees",
+            placeholder="e.g. 05:34:32",
+            pady=(0, 8),
         )
-        self._ps_ra_entry.pack(side="right")
-
-        # Dec row
-        ps_dec_row = ctk.CTkFrame(ps_panel, fg_color="transparent")
-        ps_dec_row.pack(fill="x", pady=(0, 12))
-        ctk.CTkLabel(ps_dec_row, text="Target Dec",
-                     text_color=self._pal["muted"],
-                     font=ctk.CTkFont(size=13), width=90, anchor="w",
-                     ).pack(side="left")
-        ctk.CTkLabel(ps_dec_row, text="(±DD:MM:SS  or  decimal °)",
-                     text_color=self._pal["muted"],
-                     font=ctk.CTkFont(size=11), anchor="w",
-                     ).pack(side="left", padx=(4, 0))
-        self._ps_dec_entry = ctk.CTkEntry(
-            ps_dec_row, width=180,
-            fg_color=self._pal["entry_bg"], border_color=self._pal["border"],
-            text_color=self._pal["text"], placeholder_text="e.g. +22:00:52",
+        self._ps_dec_entry = self._stacked_form_row(
+            ps_panel,
+            label="Target Dec",
+            hint="±DD:MM:SS  or  decimal degrees",
+            placeholder="e.g. +22:00:52",
+            pady=(0, 10),
         )
-        self._ps_dec_entry.pack(side="right")
 
-        # Pier side toggle
-        pier_row = ctk.CTkFrame(ps_panel, fg_color="transparent")
-        pier_row.pack(fill="x", pady=(0, 12))
-        ctk.CTkLabel(pier_row, text="Pier Side",
-                     text_color=self._pal["muted"],
-                     font=ctk.CTkFont(size=13), width=90, anchor="w",
-                     ).pack(side="left")
-        ctk.CTkLabel(pier_row, text="(which side of mount is the scope on?)",
-                     text_color=self._pal["muted"],
-                     font=ctk.CTkFont(size=11), anchor="w",
-                     ).pack(side="left", padx=(4, 0))
+        # Pier side toggle: heading on top, two equal-width buttons below.
+        ctk.CTkLabel(
+            ps_panel, text="Pier Side  —  which side of the mount is the scope on?",
+            text_color=self._pal["muted"],
+            font=ctk.CTkFont(size=11), anchor="w", justify="left",
+        ).pack(anchor="w", pady=(0, 4))
 
         self._ps_pier_var = tk.StringVar(value="1")   # default West (most common for Polaris)
-        pier_btn_frame = ctk.CTkFrame(pier_row, fg_color="transparent")
-        pier_btn_frame.pack(side="right")
+        pier_btn_frame = ctk.CTkFrame(ps_panel, fg_color="transparent")
+        pier_btn_frame.pack(fill="x", pady=(0, 10))
+        pier_btn_frame.columnconfigure((0, 1), weight=1, uniform="pier")
 
+        _pier_h = 32 if self._compact else 34
         self._pier_east_btn = ctk.CTkButton(
-            pier_btn_frame, text="◐  EAST", width=90, height=32, corner_radius=6,
+            pier_btn_frame, text="◐  EAST", height=_pier_h, corner_radius=6,
             fg_color=self._pal["motor_btn_muted"],
             hover_color=self._pal["motor_btn_muted_hover"],
             text_color="#ffffff",
             font=ctk.CTkFont(family="Courier New", size=11, weight="bold"),
             command=lambda: self._set_pier_side("0"),
         )
-        self._pier_east_btn.pack(side="left", padx=(0, 4))
+        self._pier_east_btn.grid(row=0, column=0, sticky="ew", padx=(0, 4))
 
         self._pier_west_btn = ctk.CTkButton(
-            pier_btn_frame, text="◑  WEST", width=90, height=32, corner_radius=6,
+            pier_btn_frame, text="◑  WEST", height=_pier_h, corner_radius=6,
             fg_color=self._pal["motor_btn"], hover_color=self._pal["motor_btn_hover"],
             text_color="#ffffff",
             font=ctk.CTkFont(family="Courier New", size=11, weight="bold"),
             command=lambda: self._set_pier_side("1"),
         )
-        self._pier_west_btn.pack(side="left")
+        self._pier_west_btn.grid(row=0, column=1, sticky="ew")
 
-        # CM calibrate button
+        # CM calibrate button — short text so it never overflows on narrow widths.
         self._ps_calibrate_btn = ctk.CTkButton(
             ps_panel,
-            text="⊕  Set RA/Dec  (only use for plate solve calibration)",
-            height=44, corner_radius=8,
+            text="⊕  CALIBRATE (Set RA / Dec / Pier)",
+            height=42 if self._compact else 44, corner_radius=8,
             fg_color=self._pal["motor_btn"], hover_color=self._pal["motor_btn_hover"],
             text_color="#ffffff",
-            font=ctk.CTkFont(size=13, weight="bold"),
+            font=ctk.CTkFont(size=12 if self._compact else 13, weight="bold"),
             command=self._calibrate_plate_solve,
         )
         self._ps_calibrate_btn.pack(fill="x")
@@ -355,24 +320,34 @@ class MountControlsFrame(ctk.CTkFrame):
     # ── Header ─────────────────────────────────────────────────────────────────
 
     def _build_header(self):
-        self._hdr = ctk.CTkFrame(self, fg_color=self._pal["panel"], corner_radius=0, height=48)
+        # Lower header in compact mode reclaims ~10 px of vertical space and
+        # keeps the title and status pill from colliding on narrow widths.
+        _h = 36 if self._compact else 48
+        self._hdr = ctk.CTkFrame(
+            self, fg_color=self._pal["panel"], corner_radius=0, height=_h
+        )
         self._hdr.pack(fill="x")
         self._hdr.pack_propagate(False)
 
         self._hdr_title = ctk.CTkLabel(
             self._hdr,
-            text="◈  iOptron HAE16C  ·  Equatorial",
-            font=ctk.CTkFont(family="Courier New", size=13, weight="bold"),
+            text="◈  iOptron HAE16C" if self._compact else "◈  iOptron HAE16C  ·  Equatorial",
+            font=ctk.CTkFont(
+                family="Courier New",
+                size=12 if self._compact else 13,
+                weight="bold",
+            ),
             text_color=self._pal["motor_btn"],
         )
-        self._hdr_title.pack(side="left", padx=12, pady=10)
+        self._hdr_title.pack(side="left", padx=10 if self._compact else 12, pady=8)
 
         self._conn_indicator = ctk.CTkLabel(
-            self._hdr, text="● DISCONNECTED",
+            self._hdr,
+            text="● OFFLINE" if self._compact else "● DISCONNECTED",
             font=ctk.CTkFont(family="Courier New", size=10, weight="bold"),
             text_color=self._pal["danger"],
         )
-        self._conn_indicator.pack(side="right", padx=12)
+        self._conn_indicator.pack(side="right", padx=10 if self._compact else 12)
 
     # ── Connection panel ───────────────────────────────────────────────────────
 
@@ -460,47 +435,50 @@ class MountControlsFrame(ctk.CTkFrame):
 
         self._wifi_panel.pack(fill="x", pady=(0, 8))
 
-        # Buttons — equal-width grid so nothing sits off-screen on narrow viewports.
-        btn_row = ctk.CTkFrame(panel, fg_color="transparent")
-        btn_row.pack(fill="x")
-        for c in range(4):
-            btn_row.columnconfigure(c, weight=1, uniform="conn_btns")
+        # Buttons — 2x2 grid so labels stay readable even on narrow side panels
+        # (a single row of 4 buttons clipped them at ~240 px).
+        btn_grid = ctk.CTkFrame(panel, fg_color="transparent")
+        btn_grid.pack(fill="x")
+        btn_grid.columnconfigure((0, 1), weight=1, uniform="conn_btns")
+
+        _btn_h = 34 if self._compact else 36
+        _btn_font = ctk.CTkFont(family="Courier New", size=11, weight="bold")
 
         self._connect_btn = ctk.CTkButton(
-            btn_row, text="CONNECT",
+            btn_grid, text="CONNECT", height=_btn_h,
             fg_color=self._pal["accent2"], hover_color=self._pal["accent2_hover"],
             text_color="#ffffff",
             font=ctk.CTkFont(family="Courier New", size=12, weight="bold"),
             command=self._toggle_connect,
         )
-        self._connect_btn.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        self._connect_btn.grid(row=0, column=0, sticky="ew", padx=(0, 4), pady=(0, 4))
+
+        self._home_btn = ctk.CTkButton(
+            btn_grid, text="⌂  GOTO ZERO", height=_btn_h,
+            fg_color=self._pal["danger"], hover_color=self._pal["danger_hover"],
+            font=_btn_font,
+            text_color="#ffffff", command=self._goto_zero,
+        )
+        self._home_btn.grid(row=0, column=1, sticky="ew", pady=(0, 4))
 
         self._btn_set_zero = ctk.CTkButton(
-            btn_row, text="SET ZERO", height=36,
+            btn_grid, text="SET ZERO HERE", height=_btn_h,
             fg_color=self._pal["motor_btn_muted"],
             hover_color=self._pal["motor_btn"],
             text_color="#ffffff",
-            font=ctk.CTkFont(family="Courier New", size=11, weight="bold"),
+            font=_btn_font,
             command=self._set_zero_at_current,
         )
-        self._btn_set_zero.grid(row=0, column=1, sticky="ew", padx=(0, 4))
-
-        self._home_btn = ctk.CTkButton(
-            btn_row, text="⌂ ZERO", height=36,
-            fg_color=self._pal["danger"], hover_color=self._pal["danger_hover"],
-            font=ctk.CTkFont(family="Courier New", size=12, weight="bold"),
-            text_color="#ffffff", command=self._goto_zero,
-        )
-        self._home_btn.grid(row=0, column=2, sticky="ew", padx=(0, 4))
+        self._btn_set_zero.grid(row=1, column=0, sticky="ew", padx=(0, 4))
 
         self._btn_mech_zero = ctk.CTkButton(
-            btn_row, text="MECH 0", height=36,
+            btn_grid, text="FIND MECH 0", height=_btn_h,
             fg_color=self._pal["motor_btn"], hover_color=self._pal["motor_btn_hover"],
             text_color="#ffffff",
-            font=ctk.CTkFont(family="Courier New", size=11, weight="bold"),
+            font=_btn_font,
             command=self._search_mechanical_zero,
         )
-        self._btn_mech_zero.grid(row=0, column=3, sticky="ew")
+        self._btn_mech_zero.grid(row=1, column=1, sticky="ew")
 
     # ── Live position panel ────────────────────────────────────────────────────
 
@@ -651,97 +629,112 @@ class MountControlsFrame(ctk.CTkFrame):
         )
         self._sun_step_lbl.pack(fill="x", pady=(4, 8))
 
-        sun_btn_row = ctk.CTkFrame(panel, fg_color="transparent")
-        sun_btn_row.pack(fill="x")
-        sun_btn_row.columnconfigure((0, 1, 2), weight=1, uniform="sun_btns")
+        # Refresh on its own full-width row, Slew + Sync side-by-side below.
+        # 3 buttons in a single row clipped "Sync & Track" on narrow side-panels.
+        sun_btns = ctk.CTkFrame(panel, fg_color="transparent")
+        sun_btns.pack(fill="x")
+        sun_btns.columnconfigure((0, 1), weight=1, uniform="sun_btns")
+        _sun_h = 32 if self._compact else 34
 
         self._sun_refresh_btn = ctk.CTkButton(
-            sun_btn_row,
-            text="↻  Refresh",
-            height=34,
+            sun_btns,
+            text="↻  Refresh Sun position",
+            height=_sun_h,
             fg_color=self._pal["motor_btn_muted"],
             hover_color=self._pal["motor_btn"],
             text_color="#ffffff",
             font=ctk.CTkFont(family="Courier New", size=11),
             command=self._refresh_sun_tucson_info,
         )
-        self._sun_refresh_btn.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        self._sun_refresh_btn.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 4))
 
         self._sun_slew_btn = ctk.CTkButton(
-            sun_btn_row,
-            text="⊕  Slew Sun",
-            height=34,
+            sun_btns,
+            text="⊕  Slew to Sun",
+            height=_sun_h,
             fg_color=self._pal["motor_btn"],
             hover_color=self._pal["motor_btn_hover"],
             text_color="#ffffff",
             font=ctk.CTkFont(family="Courier New", size=11, weight="bold"),
             command=self._slew_to_sun_tucson,
         )
-        self._sun_slew_btn.grid(row=0, column=1, sticky="ew", padx=(0, 4))
+        self._sun_slew_btn.grid(row=1, column=0, sticky="ew", padx=(0, 4))
 
         self._sun_track_btn = ctk.CTkButton(
-            sun_btn_row,
+            sun_btns,
             text="✓  Sync & Track",
-            height=34,
+            height=_sun_h,
             fg_color=self._pal["motor_btn"],
             hover_color=self._pal["motor_btn_hover"],
             text_color="#ffffff",
             font=ctk.CTkFont(family="Courier New", size=11, weight="bold"),
             command=self._point_and_track_sun_tucson,
         )
-        self._sun_track_btn.grid(row=0, column=2, sticky="ew")
+        self._sun_track_btn.grid(row=1, column=1, sticky="ew")
 
     # ── EQ GoTo panel ──────────────────────────────────────────────────────────
 
     def _build_goto_panel(self, parent):
-        panel = self._panel(parent, "GOTO TARGET  —  RIGHT ASCENSION & DECLINATION")
+        panel = self._panel(parent, "GOTO TARGET  —  RA  /  DEC")
 
         eq_fields = ctk.CTkFrame(panel, fg_color="transparent")
         eq_fields.pack(fill="x", pady=(0, 8))
-        eq_fields.columnconfigure((0, 1), weight=1)
+        eq_fields.columnconfigure(0, weight=1)
 
-        ctk.CTkLabel(eq_fields, text="RIGHT ASCENSION  (HH:MM:SS  or  hours  or  °)",
-                     text_color=self._pal["muted"], font=ctk.CTkFont(size=11)
-                     ).grid(row=0, column=0, sticky="w")
-        ctk.CTkLabel(eq_fields, text="DECLINATION  (−90 … +90 °)",
-                     text_color=self._pal["muted"], font=ctk.CTkFont(size=11)
-                     ).grid(row=0, column=1, sticky="w", padx=(8, 0))
-
+        # Stacked layout: each axis gets its own label + full-width entry block,
+        # so neither field can be pushed off-screen on narrow viewports.
+        ctk.CTkLabel(
+            eq_fields, text="RIGHT ASCENSION   (HH:MM:SS  ·  hours  ·  °)",
+            text_color=self._pal["muted"],
+            font=ctk.CTkFont(size=11), anchor="w",
+        ).grid(row=0, column=0, sticky="w")
         self._ra_entry = ctk.CTkEntry(
             eq_fields, placeholder_text="05:34:32",
             fg_color=self._pal["entry_bg"], border_color=self._pal["border"],
             text_color=self._pal["text"],
-            font=ctk.CTkFont(family="Courier New", size=15), height=44,
+            font=ctk.CTkFont(family="Courier New", size=14 if self._compact else 15),
+            height=40 if self._compact else 44,
         )
-        self._ra_entry.grid(row=1, column=0, sticky="ew")
+        self._ra_entry.grid(row=1, column=0, sticky="ew", pady=(2, 6))
 
+        ctk.CTkLabel(
+            eq_fields, text="DECLINATION   (−90 … +90°)",
+            text_color=self._pal["muted"],
+            font=ctk.CTkFont(size=11), anchor="w",
+        ).grid(row=2, column=0, sticky="w")
         self._dec_entry = ctk.CTkEntry(
             eq_fields, placeholder_text="+22.01",
             fg_color=self._pal["entry_bg"], border_color=self._pal["border"],
             text_color=self._pal["text"],
-            font=ctk.CTkFont(family="Courier New", size=15), height=44,
+            font=ctk.CTkFont(family="Courier New", size=14 if self._compact else 15),
+            height=40 if self._compact else 44,
         )
-        self._dec_entry.grid(row=1, column=1, sticky="ew", padx=(8, 0))
+        self._dec_entry.grid(row=3, column=0, sticky="ew", pady=(2, 0))
 
         eq_btns = ctk.CTkFrame(panel, fg_color="transparent")
         eq_btns.pack(fill="x", pady=(0, 8))
+        # Grid keeps STOP visible alongside SLEW even at very narrow widths;
+        # SLEW gets the lion's share, STOP a fixed-but-readable pill.
+        eq_btns.columnconfigure(0, weight=1)
+        eq_btns.columnconfigure(1, weight=0)
 
+        _btn_h = 40 if self._compact else 42
         self._eq_goto_btn = ctk.CTkButton(
-            eq_btns, text="⊕  SLEW TO TARGET", height=42,
+            eq_btns, text="⊕  SLEW TO TARGET", height=_btn_h,
             fg_color=self._pal["motor_btn"], hover_color=self._pal["motor_btn_hover"],
             text_color="#ffffff",
-            font=ctk.CTkFont(family="Courier New", size=13, weight="bold"),
+            font=ctk.CTkFont(family="Courier New", size=12 if self._compact else 13, weight="bold"),
             command=self._goto_eq,
         )
-        self._eq_goto_btn.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        self._eq_goto_btn.grid(row=0, column=0, sticky="ew", padx=(0, 6))
 
         self._stop_btn = ctk.CTkButton(
-            eq_btns, text="⬛  STOP", width=88, height=42,
+            eq_btns, text="⬛  STOP", width=80 if self._compact else 88, height=_btn_h,
             fg_color=self._pal["danger"], hover_color=self._pal["danger_hover"],
             font=ctk.CTkFont(family="Courier New", size=12, weight="bold"),
             text_color="#ffffff", command=self._stop,
         )
-        self._stop_btn.pack(side="left")
+        self._stop_btn.grid(row=0, column=1, sticky="ew")
 
         # Sync row — label wraps above the button so the row does not need horizontal scroll.
         self._mk_sep(panel)
@@ -780,18 +773,22 @@ class MountControlsFrame(ctk.CTkFrame):
         dpad = ctk.CTkFrame(panel, fg_color="transparent")
         dpad.pack()
 
+        # Compact dpad still ≥56 px (well above touch-target minimum) but fits
+        # in a narrow embedded sidebar without horizontal scrolling.
+        _dpad_sz = 58 if self._compact else 64
+        _dpad_font = 20 if self._compact else 22
         btn_cfg = dict(
-            width=64, height=64, corner_radius=8,
+            width=_dpad_sz, height=_dpad_sz, corner_radius=8,
             fg_color=self._pal["motor_btn_muted"],
             hover_color=self._pal["motor_btn_hover"],
-            text_color="#ffffff", font=ctk.CTkFont(size=22),
+            text_color="#ffffff", font=ctk.CTkFont(size=_dpad_font),
         )
 
         self._nudge_btns = {}
 
         def _make(text, direction, row, col):
             btn = ctk.CTkButton(dpad, text=text, **btn_cfg)
-            btn.grid(row=row, column=col, padx=4, pady=4)
+            btn.grid(row=row, column=col, padx=3, pady=3)
             btn.bind("<ButtonPress-1>",   lambda e, d=direction: self._nudge_press(d))
             btn.bind("<ButtonRelease-1>", lambda e, d=direction: self._nudge_release(d))
             self._nudge_btns[direction] = btn
@@ -799,8 +796,10 @@ class MountControlsFrame(ctk.CTkFrame):
 
         _make("▲\nDec+", "s", 0, 1)   # :ms# = Dec+
         _make("◀\nRA−",  "e", 1, 0)   # :me# = RA−
-        ctk.CTkLabel(dpad, text="✛", text_color=self._pal["muted"],
-                     font=ctk.CTkFont(size=18), width=64, height=64).grid(row=1, column=1)
+        ctk.CTkLabel(
+            dpad, text="✛", text_color=self._pal["muted"],
+            font=ctk.CTkFont(size=18), width=_dpad_sz, height=_dpad_sz,
+        ).grid(row=1, column=1)
         _make("▶\nRA+",  "w", 1, 2)   # :mw# = RA+
         _make("▼\nDec−", "n", 2, 1)   # :mn# = Dec−
 
@@ -820,26 +819,69 @@ class MountControlsFrame(ctk.CTkFrame):
     # ── Widget helpers ─────────────────────────────────────────────────────────
 
     def _mk_sep(self, parent):
-        ctk.CTkFrame(parent, fg_color=self._pal["border"], height=1).pack(fill="x", pady=8)
+        ctk.CTkFrame(parent, fg_color=self._pal["border"], height=1).pack(
+            fill="x", pady=6 if self._compact else 8
+        )
 
     def _panel(self, parent, title: str, expand: bool = False) -> ctk.CTkFrame:
         outer = ctk.CTkFrame(parent, fg_color=self._pal["panel"],
                              corner_radius=10, border_color=self._pal["border"], border_width=1)
         self._panel_outer_frames.append(outer)
-        outer.pack(fill="both", expand=expand, pady=(0, 10))
+        outer.pack(fill="both", expand=expand, pady=(0, 8 if self._compact else 10))
         title_lbl = ctk.CTkLabel(
             outer, text=title,
             font=ctk.CTkFont(family="Courier New", size=10, weight="bold"),
             text_color=self._pal["motor_btn"],
         )
         self._section_title_labels.append(title_lbl)
-        title_lbl.pack(anchor="w", padx=14, pady=(10, 0))
+        _padx = 10 if self._compact else 14
+        _pady_top = (8, 0) if self._compact else (10, 0)
+        title_lbl.pack(anchor="w", padx=_padx, pady=_pady_top)
         sep = ctk.CTkFrame(outer, fg_color=self._pal["border"], height=1)
         self._section_separators.append(sep)
-        sep.pack(fill="x", padx=14, pady=(4, 0))
+        sep.pack(fill="x", padx=_padx, pady=(4, 0))
         inner = ctk.CTkFrame(outer, fg_color="transparent")
-        inner.pack(fill="both", expand=True, padx=14, pady=10)
+        inner.pack(fill="both", expand=True, padx=_padx, pady=8 if self._compact else 10)
         return inner
+
+    def _stacked_form_row(
+        self,
+        parent,
+        *,
+        label: str,
+        hint: str,
+        placeholder: str,
+        pady: tuple = (0, 8),
+    ) -> ctk.CTkEntry:
+        """Header row (label + faint hint) on top, full-width entry below.
+
+        Stacking avoids the old "label  hint  [180px entry]" pattern which forced
+        the entry off-screen on narrow side-panels and small Pi displays.
+        """
+        row = ctk.CTkFrame(parent, fg_color="transparent")
+        row.pack(fill="x", pady=pady)
+
+        head = ctk.CTkFrame(row, fg_color="transparent")
+        head.pack(fill="x")
+        ctk.CTkLabel(
+            head, text=label, text_color=self._pal["muted"],
+            font=ctk.CTkFont(size=12 if self._compact else 13, weight="bold"),
+            anchor="w",
+        ).pack(side="left")
+        ctk.CTkLabel(
+            head, text=hint, text_color=self._pal["muted"],
+            font=ctk.CTkFont(size=10 if self._compact else 11),
+            anchor="w",
+        ).pack(side="left", padx=(6, 0))
+
+        entry = ctk.CTkEntry(
+            row,
+            fg_color=self._pal["entry_bg"], border_color=self._pal["border"],
+            text_color=self._pal["text"], placeholder_text=placeholder,
+            height=34 if self._compact else 36,
+        )
+        entry.pack(fill="x", pady=(2, 0))
+        return entry
 
     def _set_mount_controls(self, enabled: bool):
         state = "normal" if enabled else "disabled"
@@ -948,7 +990,10 @@ class MountControlsFrame(ctk.CTkFrame):
 
     def _on_connected(self, label: str, info: str, fw: str):
         self._disp_fw.set(fw or "N/A")
-        self._conn_indicator.configure(text="● CONNECTED", text_color=self._pal["success"])
+        self._conn_indicator.configure(
+            text="● ONLINE" if self._compact else "● CONNECTED",
+            text_color=self._pal["success"],
+        )
         self._connect_btn.configure(
             text="DISCONNECT", state="normal",
             fg_color=self._pal["danger"], hover_color=self._pal["danger_hover"],
@@ -996,7 +1041,10 @@ class MountControlsFrame(ctk.CTkFrame):
             self.mount = None
         self._tracking_on = False
         self._update_track_ui()
-        self._conn_indicator.configure(text="● DISCONNECTED", text_color=self._pal["danger"])
+        self._conn_indicator.configure(
+            text="● OFFLINE" if self._compact else "● DISCONNECTED",
+            text_color=self._pal["danger"],
+        )
         self._connect_btn.configure(
             text="CONNECT",
             state="normal",

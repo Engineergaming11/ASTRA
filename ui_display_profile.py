@@ -51,5 +51,8 @@ def camgui_pane_minsizes(*, compact: bool) -> tuple[int, int, int, int]:
 
 def mount_standalone_geometry_minsize(*, compact: bool) -> tuple[str, tuple[int, int]]:
     if compact:
-        return "1008x580", (640, 400)
+        # 7" Pi displays are typically 1024x600. Open at 1000x568 so the title
+        # bar / window decorations don't push us off-screen, and allow shrinking
+        # to 560x380 for kiosk panels without window chrome.
+        return "1000x568", (560, 380)
     return "980x820", (860, 700)
