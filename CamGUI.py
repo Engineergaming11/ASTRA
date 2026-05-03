@@ -1,7 +1,9 @@
 import zwoasi as asi
 import numpy as np
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog
+
+from astra_dialogs import askyesno, showerror, showinfo, showwarning
 import customtkinter as ctk
 import cv2
 from PIL import Image, ImageDraw, ImageTk
@@ -1047,14 +1049,14 @@ class ZWOCameraGUI:
                     "Use Bright stars or Moon for automatic slew and tracking."
                 )
                 _set_status(txt)
-                messagebox.showinfo("Constellations", txt, parent=dlg)
+                showinfo("Constellations", txt, parent=dlg)
                 return
 
             result = self._resolve_setup_target_radec(selected)
             if result is None:
                 msg = f"Could not resolve coordinates for '{selected}'."
                 _set_status(msg)
-                messagebox.showerror("Setup target", msg, parent=dlg)
+                showerror("Setup target", msg, parent=dlg)
                 return
             target_name, ra, dec = result
             self._goto_target_and_start_tracking(target_name, ra, dec)
@@ -1131,11 +1133,11 @@ class ZWOCameraGUI:
     def _goto_target_and_start_tracking(self, target_name: str, ra: float, dec: float):
         """Slew to target and enable target-specific tracking rate."""
         if not self.mount_panel:
-            messagebox.showwarning("Mount", "Mount panel is not available.")
+            showwarning("Mount", "Mount panel is not available.")
             return
         mount = self.mount_panel.get_mount()
         if not mount:
-            messagebox.showwarning("Mount", "Connect the mount on the right first.")
+            showwarning("Mount", "Connect the mount on the right first.")
             return
 
         if target_name.strip().lower() == "moon":
@@ -1161,14 +1163,14 @@ class ZWOCameraGUI:
         def _done(result):
             goto_msg, label = result
             self.update_status(f"{target_name}: GoTo done, {label} tracking ON.")
-            messagebox.showinfo(
+            showinfo(
                 "Setup complete",
                 f"{goto_msg}\n\nTracking enabled: {label}",
                 parent=self.root,
             )
 
         def _fail(exc):
-            messagebox.showerror("Setup target error", str(exc), parent=self.root)
+            showerror("Setup target error", str(exc), parent=self.root)
             self.update_status(f"Setup target error: {exc}")
 
         self._run_async(
@@ -2219,14 +2221,14 @@ class ZWOCameraGUI:
         if self._dsk_thread is not None and self._dsk_thread.is_alive():
             return
         if not self._dsk_lights:
-            messagebox.showinfo("Deep Sky", "Add at least one light frame first.")
+            showinfo("Deep Sky", "Add at least one light frame first.")
             return
 
         try:
             sig_lo = float(self._dsk_sigma_low_entry.get())
             sig_hi = float(self._dsk_sigma_high_entry.get())
         except Exception:
-            messagebox.showwarning("Deep Sky", "Sigma low/high must be numbers.")
+            showwarning("Deep Sky", "Sigma low/high must be numbers.")
             return
 
         out_dir = self._dsk_output_entry.get().strip()
@@ -2307,7 +2309,7 @@ class ZWOCameraGUI:
         if not result.success:
             self._dsk_status_var.set("Failed")
             self._dsk_log_line(f"FAILED: {result.message}")
-            messagebox.showerror("Deep Sky", result.message or "Stacking failed.")
+            showerror("Deep Sky", result.message or "Stacking failed.")
             return
         self._dsk_progress.configure(value=100)
         self._dsk_status_var.set(
@@ -2356,13 +2358,13 @@ class ZWOCameraGUI:
             elif sys.platform == "win32":
                 os.startfile(folder)  # type: ignore[attr-defined]
         except Exception as e:
-            messagebox.showwarning("Deep Sky", f"Could not open folder: {e}")
+            showwarning("Deep Sky", f"Could not open folder: {e}")
 
     def _dsk_use_in_plate(self):
         if self._dsk_last_result is None or not self._dsk_last_result.fits_path:
             return
         if not hasattr(self, "_plate_path_entry"):
-            messagebox.showinfo("Deep Sky", "Plate solve tab is not available.")
+            showinfo("Deep Sky", "Plate solve tab is not available.")
             return
         try:
             self._plate_path_entry.delete(0, "end")
@@ -2370,7 +2372,7 @@ class ZWOCameraGUI:
             self._focus_center_tab("Plate solve")
             self.update_status("Stacked FITS copied — open Plate solve")
         except Exception as e:
-            messagebox.showwarning("Deep Sky", f"Could not load into plate solve: {e}")
+            showwarning("Deep Sky", f"Could not load into plate solve: {e}")
 
     def _dsk_save_preview_as(self):
         if self._dsk_last_result is None or not self._dsk_last_result.preview_path:
@@ -2390,7 +2392,7 @@ class ZWOCameraGUI:
                 fw.write(fr.read())
             self._dsk_log_line(f"Saved preview copy -> {target}")
         except Exception as e:
-            messagebox.showwarning("Deep Sky", f"Save failed: {e}")
+            showwarning("Deep Sky", f"Save failed: {e}")
 
     # ──────────────────────────────────────────────────────────────────────
     #  Plate-solve tab — always-red palette, equipment preset, target tools
@@ -2795,7 +2797,7 @@ class ZWOCameraGUI:
                 'Applied 4" refractor preset (660 mm focal length, 4" aperture).'
             )
         else:
-            messagebox.showinfo(
+            showinfo(
                 "Different telescope",
                 'Enter the telescope name and focal length (mm) in the fields above, then '
                 'use "Save preset" and "Auto FOV from preset" as needed.',
@@ -2879,7 +2881,7 @@ class ZWOCameraGUI:
         try:
             data = self._read_preset_inputs()
         except Exception as e:
-            messagebox.showwarning("Preset", f"Could not read preset values: {e}")
+            showwarning("Preset", f"Could not read preset values: {e}")
             return
         self.astro_preset["telescope"] = {
             "label": data["scope_label"],
@@ -2908,7 +2910,7 @@ class ZWOCameraGUI:
         """Read pixel size + sensor size from the connected ZWO camera."""
         info = getattr(self, "camera_info", None)
         if not info:
-            messagebox.showinfo(
+            showinfo(
                 "Auto-fill from camera",
                 "Connect to a camera first; the preset will then read pixel size and sensor "
                 "dimensions directly from the ZWO SDK.",
@@ -2920,10 +2922,10 @@ class ZWOCameraGUI:
             mh = int(info.get("MaxHeight", 0))
             name = str(info.get("Name", "ZWO Camera"))
         except Exception as e:
-            messagebox.showerror("Auto-fill from camera", f"Could not read camera info:\n{e}")
+            showerror("Auto-fill from camera", f"Could not read camera info:\n{e}")
             return
         if pixel <= 0 or mw <= 0 or mh <= 0:
-            messagebox.showwarning(
+            showwarning(
                 "Auto-fill from camera",
                 "Camera reported invalid pixel size or sensor dimensions.",
             )
@@ -2960,14 +2962,14 @@ class ZWOCameraGUI:
         """Resolve the target name into RA/Dec and fill the hint entries."""
         name = (self._plate_target_entry.get() or "").strip()
         if not name:
-            messagebox.showinfo(
+            showinfo(
                 "Resolve target",
                 "Enter an object name (e.g. M42, Polaris, Jupiter) and try again.",
             )
             return
         coords = _resolve_target_name(name)
         if coords is None:
-            messagebox.showwarning(
+            showwarning(
                 "Resolve target",
                 f"Could not resolve {name!r} from the local catalogs.\n"
                 "Try a Messier ID (M1–M110), a planet/Sun/Moon, or one of the bundled "
@@ -2991,7 +2993,7 @@ class ZWOCameraGUI:
         mp = getattr(self, "mount_panel", None)
         mount = getattr(mp, "mount", None) if mp else None
         if not mount or not getattr(mount, "connected", False):
-            messagebox.showinfo(
+            showinfo(
                 "Mount RA/Dec",
                 "No mount connected. Connect on the right-hand panel and start polling first.",
             )
@@ -2999,7 +3001,7 @@ class ZWOCameraGUI:
         try:
             ra_deg, dec_deg, _pier = mount.get_current_radec()
         except Exception as e:
-            messagebox.showerror("Mount RA/Dec", f"Could not read mount position:\n{e}")
+            showerror("Mount RA/Dec", f"Could not read mount position:\n{e}")
             return
         self._plate_ra_hint.delete(0, "end")
         self._plate_ra_hint.insert(0, _deg_to_hms(float(ra_deg)))
@@ -3013,7 +3015,7 @@ class ZWOCameraGUI:
 
     def _use_last_solve_for_plate(self):
         if self._last_solve_ra_deg is None or self._last_solve_dec_deg is None:
-            messagebox.showinfo(
+            showinfo(
                 "Last solve", "No previous plate solve in this session."
             )
             return
@@ -3453,7 +3455,7 @@ class ZWOCameraGUI:
                         except Exception:
                             pass
                     else:
-                        messagebox.showerror("Error", str(e))
+                        showerror("Error", str(e))
                 self.root.after(0, _fail)
                 return
 
@@ -3463,7 +3465,7 @@ class ZWOCameraGUI:
                     try:
                         on_done(r)
                     except Exception as cb_exc:
-                        messagebox.showerror("Error", str(cb_exc))
+                        showerror("Error", str(cb_exc))
             self.root.after(0, _done)
 
         threading.Thread(target=_runner, daemon=True).start()
@@ -3521,7 +3523,7 @@ class ZWOCameraGUI:
     def _maybe_warn_solar_filter_daytime(self, activity: str):
         if not self._local_time_daytime_solar_window():
             return
-        messagebox.showwarning(
+        showwarning(
             "Solar filter",
             f"Local time is between 5:00 and 20:00. Before {activity}, make sure a proper "
             "solar filter is installed if you will observe or image the Sun.\n\n"
@@ -3586,14 +3588,14 @@ class ZWOCameraGUI:
     def _session_use_selected_for_plate(self):
         sel = self._session_listbox.curselection()
         if not sel:
-            messagebox.showinfo("Session photos", "Select a row first.")
+            showinfo("Session photos", "Select a row first.")
             return
         i = int(sel[0])
         if i < 0 or i >= len(self._session_photos):
             return
         path = self._session_photos[i].get("fits_path", "")
         if not path or not os.path.isfile(path):
-            messagebox.showwarning("Session photos", "Selected file is missing on disk.")
+            showwarning("Session photos", "Selected file is missing on disk.")
             return
         self._plate_path_entry.delete(0, "end")
         self._plate_path_entry.insert(0, path)
@@ -3602,11 +3604,11 @@ class ZWOCameraGUI:
 
     def _session_use_last_for_plate(self):
         if not self._session_photos:
-            messagebox.showinfo("Session photos", "No captures in this session yet.")
+            showinfo("Session photos", "No captures in this session yet.")
             return
         path = self._session_photos[-1].get("fits_path", "")
         if not path or not os.path.isfile(path):
-            messagebox.showwarning("Session photos", "Last capture file is missing on disk.")
+            showwarning("Session photos", "Last capture file is missing on disk.")
             return
         self._plate_path_entry.delete(0, "end")
         self._plate_path_entry.insert(0, path)
@@ -3657,10 +3659,10 @@ class ZWOCameraGUI:
     def _generate_session_pdf_report(self):
         """Build a printable PDF report for the current session captures."""
         if not self._session_photos:
-            messagebox.showinfo("Session report", "No captures in this session yet.")
+            showinfo("Session report", "No captures in this session yet.")
             return
         if not _HAS_MATPLOTLIB or PdfPages is None:
-            messagebox.showwarning("Session report", "Matplotlib PDF backend is unavailable.")
+            showwarning("Session report", "Matplotlib PDF backend is unavailable.")
             return
 
         default_name = f"session_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
@@ -3775,9 +3777,9 @@ class ZWOCameraGUI:
                     plt.close(fig)
 
             self.update_status(f"Session report saved: {save_path}")
-            messagebox.showinfo("Session report", f"PDF report created:\n{save_path}")
+            showinfo("Session report", f"PDF report created:\n{save_path}")
         except Exception as e:
-            messagebox.showerror("Session report", f"Could not generate report:\n{e}")
+            showerror("Session report", f"Could not generate report:\n{e}")
 
     def _apply_site_from_ui(self):
         try:
@@ -3785,20 +3787,20 @@ class ZWOCameraGUI:
             self.site_lon = float(self._site_lon_entry.get().strip())
             self.site_elev_m = float(self._site_elev_entry.get().strip())
             self._save_site_settings()
-            messagebox.showinfo("Site", "Site saved.")
+            showinfo("Site", "Site saved.")
         except ValueError:
-            messagebox.showwarning("Site", "Enter numeric latitude, longitude, and elevation (m).")
+            showwarning("Site", "Enter numeric latitude, longitude, and elevation (m).")
 
     def _read_gps_fill_site(self):
         port = self._gps_port_menu.get()
         if not port or port == "(none)":
-            messagebox.showwarning("GPS", "Select a serial port.")
+            showwarning("GPS", "Select a serial port.")
             return
 
         def worker():
             r = try_read_lat_lon_nmea(port)
             if not r:
-                self.root.after(0, lambda: messagebox.showwarning("GPS", "No fix read from port."))
+                self.root.after(0, lambda: showwarning("GPS", "No fix read from port."))
                 return
             lat, lon = r
             self.site_lat, self.site_lon = lat, lon
@@ -3812,7 +3814,7 @@ class ZWOCameraGUI:
         self._site_lon_entry.delete(0, "end")
         self._site_lon_entry.insert(0, str(self.site_lon))
         self._save_site_settings()
-        messagebox.showinfo("GPS", "Latitude / longitude updated from GPS.")
+        showinfo("GPS", "Latitude / longitude updated from GPS.")
 
     def _refresh_body_table(self):
         if self._last_solve_ra_deg is None:
@@ -3840,7 +3842,7 @@ class ZWOCameraGUI:
 
     def _show_polar_hints_text(self):
         if self._last_solve_ra_deg is None:
-            messagebox.showinfo("Polar hints", "Plate solve a field first.")
+            showinfo("Polar hints", "Plate solve a field first.")
             return
         txt = polar_align_mvp_text(
             self.site_lat,
@@ -3870,7 +3872,7 @@ class ZWOCameraGUI:
     def _run_embedded_plate_solve(self):
         path = self._plate_path_entry.get().strip()
         if not path or not os.path.isfile(path):
-            messagebox.showwarning("Plate solve", "Choose a valid FITS or image file.")
+            showwarning("Plate solve", "Choose a valid FITS or image file.")
             return
         self._last_plate_solve_input_path = os.path.abspath(path)
 
@@ -3881,14 +3883,14 @@ class ZWOCameraGUI:
             ra = _parse_ra_input(ra_raw) if ra_raw else None
             dec = _parse_dec_input(dec_raw) if dec_raw else None
         except Exception:
-            messagebox.showwarning(
+            showwarning(
                 "Plate solve",
                 "RA/Dec must be either decimal degrees or HMS/DMS "
                 "(e.g. 05:35:17 or +22:00:52).",
             )
             return
         if (ra is None) != (dec is None):
-            messagebox.showwarning(
+            showwarning(
                 "Plate solve",
                 "Enter both RA and Dec hints, or leave both blank for blind solve.",
             )
@@ -3900,7 +3902,7 @@ class ZWOCameraGUI:
             try:
                 fov = float(fov_raw)
             except ValueError:
-                messagebox.showwarning("Plate solve", "FOV must be a number in degrees.")
+                showwarning("Plate solve", "FOV must be a number in degrees.")
                 return
         if fov is None:
             try:
@@ -3918,7 +3920,7 @@ class ZWOCameraGUI:
             except Exception:
                 pass
         if fov is None or fov <= 0:
-            messagebox.showwarning(
+            showwarning(
                 "Plate solve",
                 "Could not determine FOV. Enter a value in degrees, or fill the equipment preset.",
             )
@@ -4051,12 +4053,13 @@ class ZWOCameraGUI:
         # Indexes 4200-4204 are split into 48 healpix tiles and individual files
         # can be 25-450 MB each, so a full set may run into many GB.
         if len(to_fetch) > 50:
-            ok = messagebox.askyesno(
+            ok = askyesno(
                 "Plate solve",
                 f"This will download {len(to_fetch)} index files from "
                 "data.astrometry.net. The smaller-scale families (4200-4204) "
                 "are split into 48 healpix tiles and the total can exceed "
                 "several GB. Continue?",
+                parent=self.root,
             )
             if not ok:
                 self._plate_out.insert(tk.END, "Download cancelled by user.\n")
@@ -4886,7 +4889,7 @@ class ZWOCameraGUI:
 
             self.update_status("Camera initialized successfully")
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to setup camera: {e}")
+            showerror("Error", f"Failed to setup camera: {e}")
 
     def refresh_cameras(self):
         if self.is_capturing:
@@ -4920,14 +4923,14 @@ class ZWOCameraGUI:
                 self.update_status("No cameras found")
 
         def fail(exc):
-            messagebox.showerror("Error", f"Failed to refresh cameras: {exc}")
+            showerror("Error", f"Failed to refresh cameras: {exc}")
             self.update_status("Error refreshing cameras")
 
         self._run_async(work, busy_message="Refreshing cameras…", on_done=done, on_error=fail)
 
     def connect_camera(self):
         if not self.available_cameras:
-            messagebox.showwarning("Warning", "No cameras available to connect")
+            showwarning("Warning", "No cameras available to connect")
             return
         if self.is_capturing:
             self.stop_preview()
@@ -4943,7 +4946,7 @@ class ZWOCameraGUI:
         try:
             camera_idx = int(selection.split(":")[0])
         except Exception:
-            messagebox.showwarning("Warning", "Pick a camera from the list first.")
+            showwarning("Warning", "Pick a camera from the list first.")
             return
 
         # Disable the connect button while we work so users don't click again.
@@ -4968,7 +4971,7 @@ class ZWOCameraGUI:
             except Exception:
                 pass
             self.update_status(f"Connected to {info['Name']}")
-            messagebox.showinfo("Success", f"Connected to {info['Name']}")
+            showinfo("Success", f"Connected to {info['Name']}")
             self.start_preview()
 
         def fail(exc):
@@ -4978,7 +4981,7 @@ class ZWOCameraGUI:
                 self.connect_btn.configure(state="normal")
             except Exception:
                 pass
-            messagebox.showerror("Error", f"Failed to connect to camera: {exc}")
+            showerror("Error", f"Failed to connect to camera: {exc}")
             self.update_status("Failed to connect to camera")
 
         self._run_async(work, busy_message="Connecting to camera…", on_done=done, on_error=fail)
@@ -5292,14 +5295,14 @@ class ZWOCameraGUI:
         if self._focus_run_busy:
             return
         if not self.camera or not self.camera_initialized:
-            messagebox.showwarning("Focus", "Please connect to a camera first.")
+            showwarning("Focus", "Please connect to a camera first.")
             return
         # Need preview running so frames stream into the cache.
         if not self.is_capturing:
             try:
                 self.start_preview()
             except Exception as exc:
-                messagebox.showerror("Focus", f"Could not start preview: {exc}")
+                showerror("Focus", f"Could not start preview: {exc}")
                 return
             if not self.is_capturing:
                 return
@@ -5640,7 +5643,7 @@ class ZWOCameraGUI:
 
     def start_preview(self):
         if not self.camera or not self.camera_initialized:
-            messagebox.showwarning("Warning", "Please connect to a camera first")
+            showwarning("Warning", "Please connect to a camera first")
             return
 
         self._maybe_warn_solar_filter_daytime("starting the live preview")
@@ -5652,7 +5655,7 @@ class ZWOCameraGUI:
             threading.Thread(target=self.preview_loop, daemon=True).start()
             threading.Thread(target=self.temperature_loop, daemon=True).start()
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to start preview: {e}")
+            showerror("Error", f"Failed to start preview: {e}")
 
     def stop_preview(self):
         try:
@@ -5775,7 +5778,7 @@ class ZWOCameraGUI:
 
     def capture_image(self):
         if not self.camera or not self.camera_initialized:
-            messagebox.showwarning("Warning", "Please connect to a camera first")
+            showwarning("Warning", "Please connect to a camera first")
             return
         if getattr(self, "_capture_in_progress", False):
             self.update_status("Capture already in progress…")
@@ -5800,7 +5803,7 @@ class ZWOCameraGUI:
             os.makedirs(capture_path, exist_ok=True)
             print(f"Capture directory: {capture_path}")
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to create capture folder: {e}")
+            showerror("Error", f"Failed to create capture folder: {e}")
             return
 
         range_text = self.exposure_range_var.get()
@@ -6018,7 +6021,7 @@ class ZWOCameraGUI:
 
             def _notify_success():
                 self.update_status(done_msg)
-                messagebox.showinfo("Success", success_msg)
+                showinfo("Success", success_msg)
 
             self.root.after(0, _notify_success)
 
@@ -6026,7 +6029,7 @@ class ZWOCameraGUI:
             import traceback
             traceback.print_exc()
             err_text = str(e)
-            self.root.after(0, lambda: messagebox.showerror("Error", f"Failed to capture images: {err_text}"))
+            self.root.after(0, lambda: showerror("Error", f"Failed to capture images: {err_text}"))
 
         finally:
             def _finalize():
@@ -6050,7 +6053,7 @@ class ZWOCameraGUI:
 
     def start_recording(self):
         if not self.camera or not self.camera_initialized:
-            messagebox.showwarning("Warning", "Please connect to a camera first")
+            showwarning("Warning", "Please connect to a camera first")
             return
 
         try:
@@ -6095,7 +6098,7 @@ class ZWOCameraGUI:
             )
 
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to start recording: {e}")
+            showerror("Error", f"Failed to start recording: {e}")
 
     def stop_recording(self, notify=True, auto_max_duration=False):
         try:
@@ -6112,13 +6115,13 @@ class ZWOCameraGUI:
                 self.update_status("Recording stopped")
             if notify:
                 if auto_max_duration:
-                    messagebox.showinfo(
+                    showinfo(
                         "Recording limit",
                         f"Video saved. Recording stops automatically after {MAX_VIDEO_RECORD_SECONDS:.0f} "
                         "seconds to limit file size on small devices.",
                     )
                 else:
-                    messagebox.showinfo("Success", "Video saved successfully")
+                    showinfo("Success", "Video saved successfully")
         except Exception as e:
             self.update_status(f"Error stopping recording: {e}")
 
