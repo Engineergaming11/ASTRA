@@ -1,5 +1,7 @@
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk
+
+from astra_dialogs import askyesno, showerror
 import serial
 import serial.tools.list_ports
 
@@ -77,7 +79,7 @@ class MountDriver:
         self.port_var.set(ports[0])
 
     def set_zero(self):
-        if messagebox.askyesno("Set Zero", "Mark current position as zero?"):
+        if askyesno("Set Zero", "Mark current position as zero?", parent=self.root):
             self.write(":SZP#")
 
     def toggle_connection(self):
@@ -88,7 +90,7 @@ class MountDriver:
                 self.btn_conn.config(text="Disconnect", bg="#cc0000")
                 self.lbl_status.config(text="●  Connected", fg="#00cc44")
             except Exception as e:
-                messagebox.showerror("Serial Error", str(e))
+                showerror("Serial Error", str(e), parent=self.root)
         else:
             self.ser.close(); self.ser = None
             self.btn_conn.config(text="Connect", bg="#4a4a4a")

@@ -19,7 +19,7 @@ import customtkinter as ctk
 import tkinter as tk
 
 from ui_display_profile import mount_standalone_geometry_minsize, ui_compact
-from tkinter import messagebox
+from astra_dialogs import showerror, showwarning
 import threading
 import time
 import datetime
@@ -1170,7 +1170,7 @@ class MountControlApp(ctk.CTk):
         self.mount = None
         self._connect_btn.configure(state="normal", text="CONNECT")
         self.log(f"Connection failed: {err}", PAL["danger"])
-        messagebox.showerror("Connection Error", err)
+        showerror("Connection Error", err, parent=self)
 
     def _connect_wifi(self):
         ip = self._wifi_ip_var.get().strip() or WIFI_DEFAULT_IP
@@ -1218,7 +1218,7 @@ class MountControlApp(ctk.CTk):
         self.mount = None
         self._connect_btn.configure(state="normal", text="CONNECT")
         self.log(f"WiFi connection failed: {err}", PAL["danger"])
-        messagebox.showerror("WiFi Error", err)
+        showerror("WiFi Error", err, parent=self)
 
     def _disconnect(self):
         self._stop_polling()
@@ -1250,7 +1250,7 @@ class MountControlApp(ctk.CTk):
         try:
             ra_deg, dec_deg = self._parse_inputs()
         except ValueError as e:
-            messagebox.showwarning("Invalid Input", str(e))
+            showwarning("Invalid Input", str(e), parent=self)
             return
         ra_hms = _deg_to_hms(ra_deg)
         dec_dms = _deg_to_dms(dec_deg)
@@ -1272,7 +1272,7 @@ class MountControlApp(ctk.CTk):
         try:
             ra_deg, dec_deg = self._parse_inputs()
         except ValueError as e:
-            messagebox.showwarning("Invalid Input", str(e))
+            showwarning("Invalid Input", str(e), parent=self)
             return
         ra_hms = _deg_to_hms(ra_deg)
         dec_dms = _deg_to_dms(dec_deg)
@@ -1490,15 +1490,18 @@ class MountControlApp(ctk.CTk):
             lat = _parse_angle_dms(self._lat_entry.get())
             lon = _parse_angle_dms(self._lon_entry.get())
         except ValueError:
-            messagebox.showwarning("Invalid Input",
+            showwarning(
+                "Invalid Input",
                 "Enter latitude and longitude as decimal degrees "
-                "or DD:MM:SS (e.g. 32:13:00 / -110:56:00).")
+                "or DD:MM:SS (e.g. 32:13:00 / -110:56:00).",
+                parent=self,
+            )
             return
         if not (-90.0 <= lat <= 90.0):
-            messagebox.showwarning("Invalid Input", "Latitude must be between −90 and +90.")
+            showwarning("Invalid Input", "Latitude must be between −90 and +90.", parent=self)
             return
         if not (-180.0 <= lon <= 180.0):
-            messagebox.showwarning("Invalid Input", "Longitude must be between −180 and +180.")
+            showwarning("Invalid Input", "Longitude must be between −180 and +180.", parent=self)
             return
 
         def _worker():
@@ -1526,12 +1529,15 @@ class MountControlApp(ctk.CTk):
             ra_deg  = _parse_ra_input(self._ps_ra_entry.get())
             dec_deg = _parse_dec_input(self._ps_dec_entry.get())
         except ValueError:
-            messagebox.showwarning("Invalid Input",
+            showwarning(
+                "Invalid Input",
                 "Enter RA as HH:MM:SS (or decimal degrees) "
-                "and Dec as \u00b1DD:MM:SS (or decimal degrees).")
+                "and Dec as \u00b1DD:MM:SS (or decimal degrees).",
+                parent=self,
+            )
             return
         if not (-90.0 <= dec_deg <= 90.0):
-            messagebox.showwarning("Invalid Input", "Declination must be between \u221290 and +90.")
+            showwarning("Invalid Input", "Declination must be between \u221290 and +90.", parent=self)
             return
 
         ra_hms  = _deg_to_hms(ra_deg)
@@ -1561,7 +1567,7 @@ class MountControlApp(ctk.CTk):
 
     def _check_connected(self) -> bool:
         if not (self.mount and self.mount.connected):
-            messagebox.showwarning("Not Connected", "Connect to the mount first.")
+            showwarning("Not Connected", "Connect to the mount first.", parent=self)
             return False
         return True
 

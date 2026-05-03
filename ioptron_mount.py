@@ -11,6 +11,8 @@ import threading
 import time
 from typing import Optional, Tuple, Union
 
+import motor_rgb_led
+
 BAUD_RATE = 115200
 TIMEOUT = 4.0
 WIFI_CONNECT_TIMEOUT = 12.0
@@ -323,12 +325,16 @@ class IOptronHAE:
                 "w": ":mw#",
             }.get(direction.lower())
             if cmd:
+                motor_rgb_led.begin_movement()
                 self.send_no_reply(cmd)
         else:
-            if direction.lower() in ("n", "s"):
-                self.send_command(":qD#")
-            else:
-                self.send_command(":qR#")
+            try:
+                if direction.lower() in ("n", "s"):
+                    self.send_command(":qD#")
+                else:
+                    self.send_command(":qR#")
+            finally:
+                motor_rgb_led.end_movement()
 
 
 class IOptronHAEWifi(IOptronHAE):

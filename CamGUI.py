@@ -53,6 +53,7 @@ from sky_ephemeris import (
     radec_to_altaz_deg,
     sun_apparent_radec_deg,
     tycho_nearest_identification,
+    write_livewcs_for_named_target,
 )
 from ioptron_mount import (
     TRACK_LUNAR,
@@ -1877,6 +1878,10 @@ class ZWOCameraGUI:
         self._sky_log = tk.Text(site, height=14, width=48, font=("Courier New", 9), wrap=tk.WORD)
         self._sky_log.pack(fill=tk.BOTH, expand=True, padx=8, pady=(4, 8))
 
+        self._center_tabs.add("Sky tracker")
+        sky_tracker_tab = self._center_tabs.tab("Sky tracker")
+        self._build_sky_tracker_tab(sky_tracker_tab)
+
         self._center_tabs.add("Deep Sky")
         deep = self._center_tabs.tab("Deep Sky")
         self._build_deep_sky_tab(deep)
@@ -1884,6 +1889,105 @@ class ZWOCameraGUI:
         self._center_tabs.add("Plate solve")
         plate = self._center_tabs.tab("Plate solve")
         self._build_plate_solve_tab(plate)
+
+    # ──────────────────────────────────────────────────────────────────────
+    #  Sky tracker tab — preset targets → LiveWCS.txt (sidebar + SkyTracker2 path)
+    # ──────────────────────────────────────────────────────────────────────
+    def _build_sky_tracker_tab(self, parent):
+        t = self.theme
+        try:
+            parent.configure(fg_color=t["bg_primary"])
+        except Exception:
+            pass
+        sky_xy = self._mk_xy(parent, t["bg_primary"])
+        sky_xy.outer.pack(fill=tk.BOTH, expand=True)
+        inner = sky_xy.inner
+
+        ctk.CTkLabel(
+            inner,
+            text="Sky tracker (offline target feed)",
+            font=("Segoe UI", 12, "bold"),
+            text_color=t["fg_primary"],
+        ).pack(anchor="w", padx=8, pady=(8, 4))
+        ctk.CTkLabel(
+            inner,
+            text=(
+                "Pick a preset star or solar system body, then update LiveWCS.txt. "
+                "The left sidebar sky tracker and other tools that read that file will follow."
+            ),
+            font=("Segoe UI", 9),
+            text_color=t["fg_secondary"],
+            wraplength=520,
+            justify="left",
+        ).pack(anchor="w", padx=8, pady=(0, 10))
+
+        row = ctk.CTkFrame(inner, fg_color="transparent")
+        row.pack(fill=tk.X, padx=8, pady=4)
+        ctk.CTkLabel(row, text="Target", font=("Segoe UI", 10), text_color=t["fg_primary"]).pack(
+            side=tk.LEFT, padx=(0, 8)
+        )
+        tracker_names = sorted(set(TYCHO_PRESET_STARS) | set(SOLAR_SYSTEM_BODIES))
+        self._sky_tracker_combo = ctk.CTkComboBox(
+            row,
+            values=tracker_names,
+            width=280,
+            state="readonly",
+            fg_color=t["bg_secondary"],
+            border_color=t["border"],
+            button_color=t["accent"],
+            button_hover_color=t["accent_light"],
+            text_color=t["fg_primary"],
+            dropdown_fg_color=t["bg_secondary"],
+            dropdown_hover_color=t["bg_tertiary"],
+            dropdown_text_color=t["fg_primary"],
+            command=lambda _c: self._apply_sky_tracker_selection(),
+        )
+        default_name = "Sirius" if "Sirius" in TYCHO_PRESET_STARS else tracker_names[0]
+        self._sky_tracker_combo.set(default_name)
+        self._sky_tracker_combo.pack(side=tk.LEFT, padx=(0, 8))
+
+        ctk.CTkButton(
+            row,
+            text="Update LiveWCS",
+            width=150,
+            font=("Segoe UI", 9, "bold"),
+            fg_color=t["accent"],
+            hover_color=t["accent_light"],
+            text_color="white",
+            command=self._apply_sky_tracker_selection,
+        ).pack(side=tk.LEFT)
+
+        self._sky_tracker_status = ctk.CTkLabel(
+            inner,
+            text="",
+            font=("Segoe UI", 9),
+            text_color=t["fg_tertiary"],
+            wraplength=520,
+            justify="left",
+        )
+        self._sky_tracker_status.pack(anchor="w", padx=8, pady=(8, 4))
+
+    def _apply_sky_tracker_selection(self):
+        combo = getattr(self, "_sky_tracker_combo", None)
+        if combo is None:
+            return
+        label = combo.get().strip()
+        ok, err = write_livewcs_for_named_target(label, self.livewcs_path)
+        if not ok:
+            self._sky_tracker_status.configure(text=err)
+            showwarning("Sky tracker", err)
+            return
+        self._sky_tracker_status.configure(
+            text=f"LiveWCS.txt updated for {label} (apparent RA/Dec, geocentric).",
+            text_color=self.theme["accent"],
+        )
+        try:
+            with open(self.livewcs_path, "r") as f:
+                data = json.load(f)
+            self._livewcs_last_mtime = os.path.getmtime(self.livewcs_path)
+            self._apply_livewcs(data)
+        except Exception as exc:
+            self._sky_tracker_status.configure(text=f"Written but could not refresh UI: {exc}")
 
     # ──────────────────────────────────────────────────────────────────────
     #  Deep Sky tab — offline stacking workflow (lights + calibration frames)
@@ -4587,7 +4691,7 @@ class ZWOCameraGUI:
         # Keep Session photos and Site/Sky action buttons red in night mode.
         try:
             tab_buttons = []
-            for tab_name in ("Session photos", "Site / Sky"):
+            for tab_name in ("Session photos", "Site / Sky", "Sky tracker"):
                 tab_buttons.extend(_descendant_ctk_buttons(self._center_tabs.tab(tab_name)))
             for btn in tab_buttons:
                 if self.night_mode:
@@ -6134,8 +6238,8 @@ class ZWOCameraGUI:
         self.update_status("Plate solve")
 
     def open_skytrack(self):
-        self._focus_center_tab("Site / Sky")
-        self.update_status("Site / Sky")
+        self._focus_center_tab("Sky tracker")
+        self.update_status("Sky tracker")
 
     def open_mount_controls(self):
         self.update_status("Mount controls are on the right")

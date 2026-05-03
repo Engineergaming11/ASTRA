@@ -460,6 +460,62 @@ def polar_align_mvp_text(
     return "\n".join(lines)
 
 
+def write_livewcs_for_named_target(label: str, path: str | Path | None = None) -> Tuple[bool, str]:
+    """Compute apparent RA/Dec (date) now and write ``LiveWCS`` JSON.
+
+    ``label`` must be a key in ``TYCHO_PRESET_STARS`` (named stars) or
+    ``SOLAR_SYSTEM_BODIES`` (Sun, Moon, planets). Uses geocentric Earth
+    position, matching :mod:`SkyTracker2` output.
+
+    Returns ``(True, "")`` on success, or ``(False, error_message)``.
+    """
+    path = livewcs_path() if path is None else Path(path)
+    label = (label or "").strip()
+    if not label:
+        return False, "Choose a target from the list."
+
+    t = ts.now()
+    earth = eph["earth"]
+
+    tyc_id = TYCHO_PRESET_STARS.get(label)
+    if tyc_id:
+        tid = _norm_tyc_id(tyc_id)
+        match = catalog.loc[catalog["TYC_ID"].str.strip() == tid]
+        if match.empty:
+            return False, f"No catalog row for {label!r} (Tycho {tyc_id})."
+        r = match.iloc[0]
+        try:
+            pm_ra = float(r["pmRA_masyr"])
+        except Exception:
+            pm_ra = 0.0
+        try:
+            pm_dec = float(r["pmDec_masyr"])
+        except Exception:
+            pm_dec = 0.0
+        if np.isnan(pm_ra):
+            pm_ra = 0.0
+        if np.isnan(pm_dec):
+            pm_dec = 0.0
+        star = Star(
+            ra_hours=float(r["RA_deg"]) / 15.0,
+            dec_degrees=float(r["Dec_deg"]),
+            ra_mas_per_year=pm_ra,
+            dec_mas_per_year=pm_dec,
+        )
+        ra, dec, _ = earth.at(t).observe(star).apparent().radec("date")
+        write_livewcs(path, ra, dec, label)
+        return True, ""
+
+    body_key = SOLAR_SYSTEM_BODIES.get(label)
+    if body_key:
+        body = eph[body_key]
+        ra, dec, _ = earth.at(t).observe(body).apparent().radec("date")
+        write_livewcs(path, ra, dec, label)
+        return True, ""
+
+    return False, f"Unknown target {label!r}."
+
+
 def write_livewcs(path: str | Path, ra, dec, object_name: str = "Unknown") -> None:
     """Write LiveWCS JSON atomically (ra, dec are Skyfield Angle objects with .hstr() / .dstr())."""
     ra_deg = ra.hours * 15.0

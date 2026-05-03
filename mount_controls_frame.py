@@ -1,7 +1,7 @@
 """Embeddable iOptron HAE16C mount control UI (CustomTkinter)."""
 import customtkinter as ctk
 import tkinter as tk
-from tkinter import messagebox
+from astra_dialogs import askyesno, showerror, showwarning
 import queue
 import threading
 import time
@@ -26,6 +26,8 @@ from ioptron_mount import (
 )
 from sky_ephemeris import radec_to_altaz_deg, sun_apparent_radec_deg
 from xy_scroll_frame import create_xy_scroll_area, theme_xy_area
+
+import motor_rgb_led
 
 # Tucson fixed-site assumption for daytime sun tracking workflow.
 TUCSON_LAT = 32.2226
@@ -146,6 +148,7 @@ class MountControlsFrame(ctk.CTkFrame):
         self._build_ui()
         self._refresh_ports()
         self._set_mount_controls(False)
+        motor_rgb_led.ensure_idle_display()
 
     def _build_ui(self):
         self._build_header()
@@ -913,7 +916,7 @@ class MountControlsFrame(ctk.CTkFrame):
         except Exception as exc:
             self.mount = None
             self.log(f"Connection failed: {exc}", self._pal["danger"])
-            messagebox.showerror("Connection Error", str(exc))
+            showerror("Connection Error", str(exc))
 
     def _connect_wifi(self):
         ip = self._wifi_ip_var.get().strip() or WIFI_DEFAULT_IP
@@ -980,7 +983,7 @@ class MountControlsFrame(ctk.CTkFrame):
         )
         self.log(f"WiFi connection failed: {err}", self._pal["danger"])
         try:
-            messagebox.showerror("WiFi Error", err, parent=self.winfo_toplevel())
+            showerror("WiFi Error", err, parent=self.winfo_toplevel())
         except tk.TclError:
             pass
 
@@ -1025,7 +1028,7 @@ class MountControlsFrame(ctk.CTkFrame):
         try:
             ra_deg, dec_deg = self._parse_inputs()
         except ValueError as e:
-            messagebox.showwarning("Invalid Input", str(e))
+            showwarning("Invalid Input", str(e))
             return
         ra_hms = _deg_to_hms(ra_deg)
         dec_dms = _deg_to_dms(dec_deg)
@@ -1033,12 +1036,19 @@ class MountControlsFrame(ctk.CTkFrame):
         threading.Thread(target=self._run_eq_goto, args=(ra_deg, dec_deg), daemon=True).start()
 
     def _run_eq_goto(self, ra_deg, dec_deg):
+        ok = False
+        motor_rgb_led.begin_movement()
         try:
             ok, msg = self.mount.goto_radec(ra_deg, dec_deg)
             color = self._pal["success"] if ok else self._pal["danger"]
             self.after(0, lambda: self.log(f"  → {msg}", color))
         except Exception as exc:
             self.after(0, lambda: self.log(f"Error: {exc}", self._pal["danger"]))
+        finally:
+            if ok:
+                motor_rgb_led.schedule_end_movement(25.0)
+            else:
+                motor_rgb_led.end_movement()
 
     # ── Sync ───────────────────────────────────────────────────────────────────
 
@@ -1047,7 +1057,7 @@ class MountControlsFrame(ctk.CTkFrame):
         try:
             ra_deg, dec_deg = self._parse_inputs()
         except ValueError as e:
-            messagebox.showwarning("Invalid Input", str(e))
+            showwarning("Invalid Input", str(e))
             return
         ra_hms = _deg_to_hms(ra_deg)
         dec_dms = _deg_to_dms(dec_deg)
@@ -1065,6 +1075,7 @@ class MountControlsFrame(ctk.CTkFrame):
         if not self._check_connected(): return
         try:
             self.mount.stop_slew()
+            motor_rgb_led.cancel_scheduled_movement_ends()
             self.log("STOP — slew halted.", self._pal["danger"])
         except Exception as exc:
             self.log(f"Error: {exc}", self._pal["danger"])
@@ -1084,15 +1095,20 @@ class MountControlsFrame(ctk.CTkFrame):
     def _goto_zero(self):
         if not self._check_connected():
             return
+        motor_rgb_led.begin_movement()
         try:
             self.mount.goto_zero()
             self.log("Slewing to saved zero position (:MH#)…", self._pal["muted"])
         except Exception as exc:
+            motor_rgb_led.end_movement()
             self.log(f"Error: {exc}", self._pal["danger"])
+        else:
+            motor_rgb_led.schedule_end_movement(30.0)
 
     def _search_mechanical_zero(self):
         if not self._check_connected():
             return
+        motor_rgb_led.begin_movement()
         try:
             ok, resp = self.mount.search_mechanical_zero()
             if ok:
@@ -1100,7 +1116,13 @@ class MountControlsFrame(ctk.CTkFrame):
             else:
                 self.log(f"Mechanical zero not accepted: {resp}", self._pal["danger"])
         except Exception as exc:
+            motor_rgb_led.end_movement()
             self.log(f"Error: {exc}", self._pal["danger"])
+        else:
+            if ok:
+                motor_rgb_led.schedule_end_movement(180.0)
+            else:
+                motor_rgb_led.end_movement()
 
     # ── Slew rate ──────────────────────────────────────────────────────────────
 
@@ -1141,9 +1163,9 @@ class MountControlsFrame(ctk.CTkFrame):
                     "(center tab: Plate solve)."
                 )
                 try:
-                    messagebox.showwarning(title, text, parent=self.winfo_toplevel())
+                    showwarning(title, text, parent=self.winfo_toplevel())
                 except tk.TclError:
-                    messagebox.showwarning(title, text)
+                    showwarning(title, text)
                 return
         self._tracking_on = will_enable
         try:
@@ -1195,7 +1217,7 @@ class MountControlsFrame(ctk.CTkFrame):
 
     def _confirm_solar_safety(self) -> bool:
         """Single safety gate shared by every step that drives the mount toward the Sun."""
-        return messagebox.askyesno(
+        return askyesno(
             "Solar safety confirmation",
             "Solar observing is hazardous.\n\n"
             "Confirm a proper solar filter is installed on ALL optics (scope, finder, and camera) "
@@ -1215,11 +1237,13 @@ class MountControlsFrame(ctk.CTkFrame):
         self.log("Slewing to Sun (Tucson ephemeris)…", self._pal["motor_btn"])
 
         def _worker():
+            ok_goto = False
+            motor_rgb_led.begin_movement()
             try:
                 ra, dec = sun_apparent_radec_deg(TUCSON_LAT, TUCSON_LON, TUCSON_ELEV_M)
                 alt, az = radec_to_altaz_deg(ra, dec, TUCSON_LAT, TUCSON_LON, TUCSON_ELEV_M)
-                ok, msg = self.mount.goto_radec(ra, dec)
-                if not ok:
+                ok_goto, msg = self.mount.goto_radec(ra, dec)
+                if not ok_goto:
                     self.after(
                         0,
                         lambda m=msg: (
@@ -1258,6 +1282,11 @@ class MountControlsFrame(ctk.CTkFrame):
                         self.log(f"Slew to Sun error: {e}", self._pal["danger"]),
                     ),
                 )
+            finally:
+                if ok_goto:
+                    motor_rgb_led.schedule_end_movement(25.0)
+                else:
+                    motor_rgb_led.end_movement()
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -1471,15 +1500,15 @@ class MountControlsFrame(ctk.CTkFrame):
             lat = _parse_angle_dms(self._lat_entry.get())
             lon = _parse_angle_dms(self._lon_entry.get())
         except ValueError:
-            messagebox.showwarning("Invalid Input",
+            showwarning("Invalid Input",
                 "Enter latitude and longitude as decimal degrees "
                 "or DD:MM:SS (e.g. 32:13:00 / -110:56:00).")
             return
         if not (-90.0 <= lat <= 90.0):
-            messagebox.showwarning("Invalid Input", "Latitude must be between −90 and +90.")
+            showwarning("Invalid Input", "Latitude must be between −90 and +90.")
             return
         if not (-180.0 <= lon <= 180.0):
-            messagebox.showwarning("Invalid Input", "Longitude must be between −180 and +180.")
+            showwarning("Invalid Input", "Longitude must be between −180 and +180.")
             return
 
         def _worker():
@@ -1521,12 +1550,12 @@ class MountControlsFrame(ctk.CTkFrame):
             ra_deg  = _parse_ra_input(self._ps_ra_entry.get())
             dec_deg = _parse_dec_input(self._ps_dec_entry.get())
         except ValueError:
-            messagebox.showwarning("Invalid Input",
+            showwarning("Invalid Input",
                 "Enter RA as HH:MM:SS (or decimal degrees) "
                 "and Dec as \u00b1DD:MM:SS (or decimal degrees).")
             return
         if not (-90.0 <= dec_deg <= 90.0):
-            messagebox.showwarning("Invalid Input", "Declination must be between \u221290 and +90.")
+            showwarning("Invalid Input", "Declination must be between \u221290 and +90.")
             return
 
         ra_hms  = _deg_to_hms(ra_deg)
@@ -1559,7 +1588,7 @@ class MountControlsFrame(ctk.CTkFrame):
 
     def _check_connected(self) -> bool:
         if not (self.mount and self.mount.connected):
-            messagebox.showwarning("Not Connected", "Connect to the mount first.")
+            showwarning("Not Connected", "Connect to the mount first.")
             return False
         return True
 
@@ -1771,6 +1800,7 @@ class MountControlsFrame(ctk.CTkFrame):
         if self.mount:
             self.mount.disconnect()
             self.mount = None
+        motor_rgb_led.cleanup()
         if self._standalone:
             self.winfo_toplevel().destroy()
 
@@ -1785,4 +1815,5 @@ class MountControlsFrame(ctk.CTkFrame):
             except Exception:
                 pass
             self.mount = None
+        motor_rgb_led.cleanup()
 
