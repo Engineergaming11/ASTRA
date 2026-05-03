@@ -21,7 +21,9 @@ Dependencies (same as before + astropy, sep):
 """
 
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog
+
+from astra_dialogs import askyesno, showerror, showwarning
 import numpy as np
 from PIL import Image, ImageTk, ImageDraw, ImageFont
 import threading
@@ -371,6 +373,13 @@ def run_solve_field_local(
     # Allow very small pixel scales for high-resolution sensors with narrow FOV.
     scale_low = max(0.05, (fov_f * 3600.0 / 5000.0) * 0.45)
     scale_high = min(5.0, (fov_f * 3600.0 / 500.0) * 1.65)
+    # Blind solve still knows FOV from the UI; constraining plate scale avoids a
+    # huge astrometry search space and reduces spurious timeouts under --cpulimit.
+    scale_blind_args = [
+        "--scale-units", "arcsecperpix",
+        "--scale-low", str(max(0.05, scale_low * 0.5)),
+        "--scale-high", str(min(10.0, scale_high * 2.0)),
+    ]
 
     passes = []
     if ra_f is not None and dec_f is not None:
@@ -389,9 +398,21 @@ def run_solve_field_local(
             ]),
         ])
     passes.append(
-        ("Blind solve fallback", [
-            "--no-plots", "--downsample", "2", "--sigma", "2", "--objs", "1000", "--cpulimit", "180",
-        ])
+        (
+            "Blind solve fallback",
+            [
+                "--no-plots",
+                "--downsample",
+                "2",
+                "--sigma",
+                "2",
+                "--objs",
+                "1000",
+                "--cpulimit",
+                "400",
+            ]
+            + scale_blind_args,
+        )
     )
     all_stdout = [f"Astrometry setup:\n{setup_log}\n"]
     all_stderr = []
@@ -426,7 +447,18 @@ def run_solve_field_local(
             png_base = out_basename + "-png"
             out, err, rc = _solve_with_args(
                 png_candidate,
-                ["--no-plots", "--downsample", "2", "--sigma", "2", "--objs", "1000", "--cpulimit", "180"],
+                [
+                    "--no-plots",
+                    "--downsample",
+                    "2",
+                    "--sigma",
+                    "2",
+                    "--objs",
+                    "1000",
+                    "--cpulimit",
+                    "400",
+                ]
+                + scale_blind_args,
                 "PNG fallback solve",
                 png_base,
             )
@@ -847,7 +879,7 @@ class StarFinderGUI:
                         shutil.copy2(src, dest)
                         load_path = str(dest)
                     except OSError as e:
-                        messagebox.showerror("Session", f"Could not copy image into session folder:\n{e}")
+                        showerror("Session", f"Could not copy image into session folder:\n{e}")
                         return
             self.current_image_path = load_path
             self.detected_stars = []
@@ -904,7 +936,7 @@ class StarFinderGUI:
 
     def detect_stars_only(self):
         if not self.current_image_path:
-            messagebox.showwarning("No image", "Load an image first.")
+            showwarning("No image", "Load an image first.")
             return
         self.progress_label.config(text="Detecting stars...")
         self.detect_local_btn.config(state=tk.DISABLED)
@@ -926,7 +958,7 @@ class StarFinderGUI:
                 self.detected_stars = star_list
                 self.root.after(0, self._show_detected_stars, star_list)
             except Exception as e:
-                self.root.after(0, lambda: messagebox.showerror("Error", str(e)))
+                self.root.after(0, lambda err=str(e): showerror("Error", err, parent=self.root))
                 self.detect_local_btn.config(state=tk.NORMAL)
                 self.progress_label.config(text="")
 
@@ -948,7 +980,7 @@ class StarFinderGUI:
 
     def start_solving(self):
         if not self.current_image_path:
-            messagebox.showwarning("No image", "Load an image first.")
+            showwarning("No image", "Load an image first.")
             return
         if self.solving:
             return
@@ -957,7 +989,7 @@ class StarFinderGUI:
             dec = float(self.dec_entry.get().strip())
             fov = float(self.fov_entry.get().strip())
         except Exception:
-            messagebox.showerror("Invalid input", "RA, Dec, FOV must be numeric.")
+            showerror("Invalid input", "RA, Dec, FOV must be numeric.")
             return
 
         self.solving = True
@@ -1018,7 +1050,7 @@ class StarFinderGUI:
     def _solve_failed(self, res):
         self.progress_label.config(text="✗ Failed")
         self._append_result("Solve failed.")
-        messagebox.showerror("Error", "Solving failed. Check output above.")
+        showerror("Error", "Solving failed. Check output above.")
 
     def _solve_succeeded(self, res):
         self.progress_label.config(text="✓ Success")
@@ -1030,13 +1062,13 @@ class StarFinderGUI:
 
     def view_annotated(self):
         if not self.annotated_png_path or not Path(self.annotated_png_path).exists():
-            messagebox.showwarning("Not available", "No annotated image.")
+            showwarning("Not available", "No annotated image.")
             return
         self.display_image(self.annotated_png_path)
 
     def view_solved(self):
         if not self.solved_fits_path or not Path(self.solved_fits_path).exists():
-            messagebox.showwarning("Not available", "No solved FITS.")
+            showwarning("Not available", "No solved FITS.")
             return
         out_png = str(Path(self.solved_fits_path).with_suffix(".solved.png"))
         try:
@@ -1058,23 +1090,24 @@ class StarFinderGUI:
             pil.save(out_png)
             self.display_image(out_png)
         except Exception as e:
-            messagebox.showerror("Error", f"Could not render: {e}")
+            showerror("Error", f"Could not render: {e}")
 
 if __name__ == "__main__":
     root = tk.Tk()
     root.withdraw()
     session_path = None
     try:
-        if messagebox.askyesno(
+        if askyesno(
             "Session",
             "Start a new observing session?\n\n"
             "Yes: create a folder (date and time) under the app's sessions/ directory.\n"
             "Loaded images are copied there; plate-solve outputs stay in the same folder.\n\n"
             "No: work without a session (solver writes next to the image you load).",
+            parent=root,
         ):
             session_path = create_session_folder()
     except OSError as e:
-        messagebox.showerror("Session", f"Could not create session folder:\n{e}")
+        showerror("Session", f"Could not create session folder:\n{e}", parent=root)
     root.deiconify()
     app = StarFinderGUI(root, session_dir=session_path)
     root.mainloop()
